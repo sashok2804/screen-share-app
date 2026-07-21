@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+*.log
+.env
+.env.local
+.vite/
+
+# TypeScript incremental build artifacts (from tsc -b)
+*.tsbuildinfo
+vite.config.d.ts
+vite.config.js
+vitest.config.d.ts
+vitest.config.js
+
+# TLS certs (generated locally, never commit)
+server/certs/*.pem

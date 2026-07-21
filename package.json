@@ -1,0 +1,26 @@
+{
+  "name": "screen-share-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "P2P WebRTC screen-sharing rooms with 1440p@60fps demo streaming",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,magenta \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "npm -w server run dev",
+    "dev:client": "npm -w client run dev",
+    "build": "npm -w server run build && npm -w client run build",
+    "start": "npm -w server start",
+    "test": "npm -w server test && npm -w client test",
+    "test:watch": "concurrently -n server,client -c blue,magenta \"npm -w server run test:watch\" \"npm -w client run test:watch\"",
+    "test:coverage": "npm -w server run test:coverage && npm -w client run test:coverage"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
