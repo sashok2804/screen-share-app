@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'self';"
+  />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Настройки сервера — Screen Share</title>
+  <style>
+    /* Dark theme mirroring the React client (slate-950/indigo accent). Keep
+       everything inline so the page works from file:// without a server. */
+    :root {
+      color-scheme: dark;
+      --bg: #0b0e14;
+      --panel: #0f172a;        /* slate-900 */
+      --panel-2: #111827;      /* gray-900 */
+      --text: #e2e8f0;         /* slate-200 */
+      --muted: #94a3b8;        /* slate-400 */
+      --accent: #6366f1;       /* indigo-500 */
+      --accent-hover: #4f46e5; /* indigo-600 */
+      --danger: #ef4444;
+      --border: #1f2937;       /* gray-800 */
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Roboto",
+        "Helvetica Neue", Arial, sans-serif;
+      font-size: 14px;
+      -webkit-font-smoothing: antialiased;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      user-select: none;
+    }
+    .card {
+      width: 100%;
+      max-width: 480px;
+      background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px;
+      box-shadow: 0 24px 48px rgba(0, 0, 0, 0.4);
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 6px;
+    }
+    .logo .dot {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+      box-shadow: 0 6px 16px rgba(99, 102, 241, 0.35);
+    }
+    .logo h1 {
+      font-size: 18px;
+      font-weight: 600;
+      margin: 0;
+      letter-spacing: -0.01em;
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 13px;
+      margin: 0 0 22px 40px;
+    }
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin: 0 0 6px 2px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    input[type="text"],
+    input[type="url"] {
+      width: 100%;
+      padding: 11px 14px;
+      background: #0b0e14;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 120ms ease, box-shadow 120ms ease;
+    }
+    input[type="text"]:focus,
+    input[type="url"]:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.18);
+    }
+    .field { margin-bottom: 18px; }
+
+    .check {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 12px 14px;
+      background: rgba(99, 102, 241, 0.06);
+      border: 1px solid rgba(99, 102, 241, 0.2);
+      border-radius: 10px;
+      cursor: pointer;
+      user-select: none;
+      margin-bottom: 22px;
+    }
+    .check input[type="checkbox"] {
+      appearance: none;
+      width: 18px;
+      height: 18px;
+      margin: 1px 0 0 0;
+      border: 1px solid var(--muted);
+      border-radius: 5px;
+      background: transparent;
+      cursor: pointer;
+      position: relative;
+      flex-shrink: 0;
+    }
+    .check input[type="checkbox"]:checked {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .check input[type="checkbox"]:checked::after {
+      content: "";
+      position: absolute;
+      left: 5px;
+      top: 1px;
+      width: 5px;
+      height: 10px;
+      border: solid white;
+      border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+    }
+    .check .label-text {
+      font-size: 13px;
+      color: var(--text);
+      line-height: 1.4;
+    }
+    .check .label-text small {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 2px;
+    }
+
+    button.primary {
+      width: 100%;
+      padding: 12px 16px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 120ms ease, transform 80ms ease;
+    }
+    button.primary:hover:not(:disabled) { background: var(--accent-hover); }
+    button.primary:active:not(:disabled) { transform: translateY(1px); }
+    button.primary:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+
+    .status {
+      margin-top: 12px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.4;
+      display: none;
+    }
+    .status.error {
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.4);
+      color: #fecaca;
+      display: block;
+    }
+    .status.info {
+      background: rgba(99, 102, 241, 0.1);
+      border: 1px solid rgba(99, 102, 241, 0.35);
+      color: #c7d2fe;
+      display: block;
+    }
+
+    .banner {
+      margin-bottom: 20px;
+      padding: 11px 14px;
+      border-radius: 10px;
+      font-size: 13px;
+      line-height: 1.4;
+      display: none;
+    }
+    .banner.warn {
+      background: rgba(245, 158, 11, 0.1);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      color: #fde68a;
+      display: block;
+    }
+
+    footer {
+      margin-top: 22px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    footer .version { font-variant-numeric: tabular-nums; }
+    footer a {
+      color: var(--muted);
+      text-decoration: none;
+      cursor: pointer;
+    }
+    footer a:hover { color: var(--text); }
+
+    .spinner {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      margin-right: 8px;
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      border-top-color: white;
+      border-radius: 50%;
+      animation: spin 700ms linear infinite;
+      vertical-align: -2px;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <main class="card" role="main">
+    <div class="logo">
+      <div class="dot" aria-hidden="true"></div>
+      <h1>Screen Share</h1>
+    </div>
+    <p class="subtitle" id="subtitle">Подключение к серверу</p>
+
+    <div class="banner warn" id="error-banner" role="alert" style="display:none"></div>
+
+    <form id="form" autocomplete="off">
+      <div class="field">
+        <label for="url">Адрес сервера</label>
+        <input
+          id="url"
+          name="url"
+          type="url"
+          inputmode="url"
+          spellcheck="false"
+          placeholder="https://localhost:3000"
+          required
+        />
+      </div>
+
+      <label class="check" for="trust">
+        <input id="trust" name="trust" type="checkbox" checked />
+        <span class="label-text">
+          Доверять self-signed сертификатам
+          <small>Включите для self-signed сертификатов (например, localhost).</small>
+        </span>
+      </label>
+
+      <button id="connect" type="submit" class="primary">Подключиться</button>
+      <div class="status" id="status"></div>
+    </form>
+
+    <footer>
+      <span class="version">Версия приложения: <span id="version">—</span></span>
+      <a id="reset" title="Удалить сохранённые настройки и показать экран первого запуска">Сбросить настройки</a>
+    </footer>
+  </main>
+
+  <script>
+    "use strict";
+    // The settings window is loaded from file:// via Electron's loadFile, so
+    // we have access to window.electronAPI (exposed by preload.cjs). Guard
+    // every access so a missing preload doesn't throw.
+    /** @type {any} */
+    const api = window.electronAPI;
+
+    const $ = (id) => document.getElementById(id);
+    const urlInput = $("url");
+    const trustInput = $("trust");
+    const form = $("form");
+    const connectBtn = $("connect");
+    const statusEl = $("status");
+    const bannerEl = $("error-banner");
+    const subtitleEl = $("subtitle");
+    const versionEl = $("version");
+    const resetLink = $("reset");
+
+    // Read ?mode=...&error=... query string that main.cjs passes via loadFile.
+    const params = new URLSearchParams(window.location.search);
+    const mode = params.get("mode") || "first-run";
+    const errorMessage = params.get("error");
+
+    /**
+     * Render a status message under the Connect button. Type is "error",
+     * "info", or empty to clear.
+     * @param {string} msg
+     * @param {"error"|"info"} [type]
+     */
+    function setStatus(msg, type) {
+      if (!msg) {
+        statusEl.className = "status";
+        statusEl.textContent = "";
+        return;
+      }
+      statusEl.className = "status " + (type || "info");
+      statusEl.textContent = msg;
+    }
+
+    /**
+     * Show the orange banner at the top of the form (used in error mode).
+     * @param {string} msg
+     */
+    function setBanner(msg) {
+      if (!msg) {
+        bannerEl.style.display = "none";
+        bannerEl.textContent = "";
+        return;
+      }
+      bannerEl.style.display = "block";
+      bannerEl.textContent = msg;
+    }
+
+    /**
+     * Disable the Connect button + show a spinner. Pass `false` to reset.
+     * @param {boolean} busy
+     * @param {string} [busyText]
+     */
+    function setBusy(busy, busyText) {
+      connectBtn.disabled = busy;
+      connectBtn.innerHTML = busy
+        ? '<span class="spinner"></span>' + (busyText || "Подключение…")
+        : "Подключиться";
+    }
+
+    /**
+     * Tiny URL sanity check. The main process re-validates, but we want to
+     * avoid a round-trip for obvious mistakes (empty / no scheme).
+     * @param {string} v
+     */
+    function looksLikeUrl(v) {
+      if (!v) return false;
+      if (/^https?:\/\//i.test(v)) return true;
+      // Allow "host:port" or "host" — main process prepends https://.
+      return /^[a-z0-9.-]+(:\d+)?(\/.*)?$/i.test(v);
+    }
+
+    // ---- Bootstrap: pull the current config from main and prefill the form.
+    (async function init() {
+      // App version (footer).
+      try {
+        if (api && typeof api.getAppVersion === "function") {
+          versionEl.textContent = api.getAppVersion() || "—";
+        }
+      } catch {
+        /* ignore */
+      }
+
+      // Subtitle / banner copy depends on why we're showing the form.
+      if (mode === "error") {
+        subtitleEl.textContent = "Не удалось подключиться к серверу";
+        setBanner(
+          errorMessage
+            ? "Предыдущая попытка: " + errorMessage
+            : "Сервер недоступен. Проверьте адрес и подключение.",
+        );
+      } else if (mode === "settings") {
+        subtitleEl.textContent = "Смена адреса сервера";
+      } else {
+        subtitleEl.textContent =
+          "Первый запуск — введите адрес сервера для подключения";
+      }
+
+      // Prefill from saved config (if any).
+      try {
+        if (api && typeof api.getServerConfig === "function") {
+          const cfg = await api.getServerConfig();
+          if (cfg && cfg.url) urlInput.value = cfg.url;
+          if (cfg && typeof cfg.trustSelfSignedCerts === "boolean") {
+            trustInput.checked = cfg.trustSelfSignedCerts;
+          }
+        }
+      } catch (err) {
+        // Non-fatal — leave the defaults.
+        // eslint-disable-next-line no-console
+        console.warn("[server-config] getServerConfig failed:", err);
+      }
+      // Focus the URL field for quick typing.
+      urlInput.focus();
+      urlInput.select();
+    })();
+
+    // ---- Form submit → save + connect.
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      setBanner("");
+
+      const url = urlInput.value.trim();
+      if (!looksLikeUrl(url)) {
+        setStatus("Введите корректный адрес (например, https://localhost:3000)", "error");
+        urlInput.focus();
+        return;
+      }
+
+      setBusy(true);
+      setStatus("", "");
+
+      try {
+        if (!api || typeof api.connectToServer !== "function") {
+          // Fallback for environments without preload (shouldn't happen in the
+          // packaged app, but let's not brick the form).
+          throw new Error("electronAPI.connectToServer unavailable");
+        }
+        const result = await api.connectToServer({
+          url,
+          trustSelfSignedCerts: trustInput.checked,
+        });
+        if (!result || result.ok !== true) {
+          setBusy(false);
+          setStatus(
+            (result && result.error) || "Не удалось сохранить настройки",
+            "error",
+          );
+        }
+        // On success the main process closes this window; nothing else to do.
+      } catch (err) {
+        setBusy(false);
+        setStatus(
+          err && err.message ? err.message : "Неизвестная ошибка",
+          "error",
+        );
+      }
+    });
+
+    // ---- "Reset settings" link — wipe the config and reload as first-run.
+    resetLink.addEventListener("click", async (event) => {
+      event.preventDefault();
+      const ok = window.confirm(
+        "Удалить сохранённые настройки сервера? При следующем запуске приложение попросит ввести адрес заново.",
+      );
+      if (!ok) return;
+
+      try {
+        if (api && typeof api.resetServerConfig === "function") {
+          await api.resetServerConfig();
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn("[server-config] reset failed:", err);
+      }
+      // Reset the form to defaults so the user sees a clean slate, then reload
+      // the page in first-run mode (also clears the error banner).
+      urlInput.value = "https://localhost:3000";
+      trustInput.checked = true;
+      setBanner("");
+      setStatus("", "");
+      subtitleEl.textContent = "Настройки сброшены. Введите адрес сервера.";
+      // Re-fetch the (now-default) config so the form reflects truth.
+      try {
+        if (api && typeof api.getServerConfig === "function") {
+          const cfg = await api.getServerConfig();
+          if (cfg && cfg.url) urlInput.value = cfg.url;
+          if (cfg && typeof cfg.trustSelfSignedCerts === "boolean") {
+            trustInput.checked = cfg.trustSelfSignedCerts;
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    });
+  </script>
+</body>
+</html>

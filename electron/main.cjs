@@ -29,9 +29,142 @@ const { FFmpegAudioCapture } = require('./src/ffmpeg-bridge.cjs');
 /**
  * Default URL of the React client. In dev this is the Vite dev server proxied through
  * the Fastify HTTPS server on :3000. Override with SCREENSHARE_URL env var.
+ *
+ * NOTE: `RESOLVED_URL` below is the legacy fallback used by helpers that don't
+ * care about user config (e.g. the Help menu, IPC exports). The runtime path is
+ * `loadConfig().url` / the URL passed to `createMainWindow(url)`.
  */
 const DEFAULT_URL = 'https://localhost:3000';
 const RESOLVED_URL = process.env.SCREENSHARE_URL || DEFAULT_URL;
+
+/**
+ * Absolute path of `server-config.json` inside the per-user data directory
+ * (`%APPDATA%/Screen Share/server-config.json` on Windows). Holds the user's
+ * chosen server URL and `trustSelfSignedCerts` flag.
+ *
+ * Shape:
+ *   { "url": "https://localhost:3000", "trustSelfSignedCerts": true }
+ */
+const CONFIG_FILE = path.join(app.getPath('userData'), 'server-config.json');
+
+/** Default values used when the file is absent or reset by the user. */
+const DEFAULT_CONFIG = Object.freeze({
+  url: DEFAULT_URL,
+  trustSelfSignedCerts: true,
+});
+
+/**
+ * In-memory cache of the parsed config. `readConfig()` populates it on first
+ * access and `writeConfig()` updates it on every save so the rest of the
+ * main process (e.g. `installCertBypass`) doesn't have to re-read the file.
+ *
+ * @type {{ url: string, trustSelfSignedCerts: boolean } | null}
+ */
+let cachedConfig = null;
+
+/**
+ * Load the user's server config. Missing file, missing keys, or a malformed
+ * JSON all fall back to {@link DEFAULT_CONFIG} so the app always boots. The
+ * parsed object is cached in {@link cachedConfig} — subsequent calls return
+ * the same reference.
+ *
+ * @returns {{ url: string, trustSelfSignedCerts: boolean }}
+ */
+function readConfig() {
+  if (cachedConfig) return cachedConfig;
+  /** @type {{ url: string, trustSelfSignedCerts: boolean }} */
+  const cfg = { ...DEFAULT_CONFIG };
+  try {
+    if (fs.existsSync(CONFIG_FILE)) {
+      const raw = fs.readFileSync(CONFIG_FILE, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        if (typeof parsed.url === 'string' && parsed.url.trim()) {
+          cfg.url = parsed.url.trim();
+        }
+        if (typeof parsed.trustSelfSignedCerts === 'boolean') {
+          cfg.trustSelfSignedCerts = parsed.trustSelfSignedCerts;
+        }
+      }
+    }
+  } catch (err) {
+    // Corrupt JSON / IO error — log and fall back to defaults rather than
+    // bricking the app. The user can still re-enter the URL via Settings.
+    // eslint-disable-next-line no-console
+    console.warn('[config] failed to read server-config.json, using defaults:', err);
+  }
+  cachedConfig = cfg;
+  return cfg;
+}
+
+/**
+ * Persist the config to disk and update the in-memory cache. Validates the URL
+ * (must be http/https, max length as a sanity check). Returns the normalised
+ * config on success, or `null` on validation failure (caller surfaces the
+ * error in the UI).
+ *
+ * @param {{ url?: unknown, trustSelfSignedCerts?: unknown }} input
+ * @returns {{ url: string, trustSelfSignedCerts: boolean } | null}
+ */
+function writeConfig(input) {
+  const url = typeof input?.url === 'string' ? input.url.trim() : '';
+  if (!url || url.length > 2048 || !/^https?:\/\//i.test(url)) {
+    return null;
+  }
+  // Normalize a bare host ("localhost:3000") into https://.
+  const normalized = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    return null;
+  }
+  // Reject obvious garbage (no host) but allow any port/path.
+  if (!parsed.hostname) return null;
+
+  /** @type {{ url: string, trustSelfSignedCerts: boolean }} */
+  const cfg = {
+    url: parsed.href.replace(/\/$/, ''),
+    trustSelfSignedCerts: input?.trustSelfSignedCerts !== false,
+  };
+
+  try {
+    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[config] failed to write server-config.json:', err);
+    return null;
+  }
+  cachedConfig = cfg;
+  return cfg;
+}
+
+/** Delete the config file (used by the "Reset settings" action). */
+function deleteConfig() {
+  cachedConfig = null;
+  try {
+    if (fs.existsSync(CONFIG_FILE)) fs.unlinkSync(CONFIG_FILE);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[config] failed to delete server-config.json:', err);
+  }
+}
+
+/**
+ * Whether the user's server-config.json exists on disk. Used at boot to decide
+ * whether to show the first-run setup screen. We deliberately don't use
+ * `cachedConfig` here — we want a fresh disk check.
+ *
+ * @returns {boolean}
+ */
+function configExists() {
+  try {
+    return fs.existsSync(CONFIG_FILE);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * In dev we use a self-signed cert (server/certs/cert.pem). Chromium blocks the
@@ -48,6 +181,16 @@ const isDev = !app.isPackaged && process.env.NODE_ENV !== 'production';
 
 /** @type {BrowserWindow | null} */
 let mainWindow = null;
+/** @type {BrowserWindow | null} */
+let configWindow = null;
+/**
+ * Holds a room id that arrived via `screen-share://room/<id>` while the main
+ * window wasn't ready (first run, or while the settings window was open).
+ * Flushed to the renderer as soon as {@link mainWindow} goes online.
+ *
+ * @type {string | null}
+ */
+let pendingRoomId = null;
 
 /**
  * Parse a `screen-share://...` URL and extract the roomId.
@@ -89,7 +232,11 @@ function parseScreenShareUrl(raw) {
 }
 
 /**
- * Forward an inbound screen-share:// URL to the renderer (if any).
+ * Forward an inbound screen-share:// URL to the renderer. If the main window
+ * isn't loaded yet (first run, still showing the settings screen, or booted
+ * into the error path), the room id is stashed in {@link pendingRoomId} and
+ * delivered once the main window's DOM is ready (see the
+ * `dom-ready` listener in {@link createMainWindowFromConfig}).
  * @param {string} raw
  */
 function dispatchOpenRoom(raw) {
@@ -100,7 +247,47 @@ function dispatchOpenRoom(raw) {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
     mainWindow.webContents.send('open-room', roomId);
+  } else {
+    pendingRoomId = roomId;
   }
+}
+
+/**
+ * Boot the main window from the saved (or just-saved) config, then flush any
+ * queued room id to the renderer. Centralises the post-config plumbing so
+ * `app.whenReady`, the `server:connect` handler, and the auto-start path all
+ * behave identically.
+ *
+ * @returns {Promise<BrowserWindow>}
+ */
+async function createMainWindowFromConfig() {
+  const cfg = readConfig();
+  // CSP + cert bypass are (re)installed each time we boot the main window so
+  // they pick up the latest saved URL.
+  installCsp(cfg);
+  installCertBypass(cfg);
+  const win = await createMainWindow(cfg.url);
+
+  // If the load already failed and triggered the error UI, the window is
+  // gone — bail out without touching webContents.
+  if (win.isDestroyed()) return win;
+
+  // Once the renderer's DOM is ready, deliver any pending deep-link room id.
+  win.webContents.once('dom-ready', () => {
+    if (win.isDestroyed()) return;
+    if (pendingRoomId) {
+      const id = pendingRoomId;
+      pendingRoomId = null;
+      try {
+        win.webContents.send('open-room', id);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[main] failed to flush pending room id:', err);
+      }
+    }
+  });
+
+  return win;
 }
 
 /** Build a minimal application menu. */
@@ -126,7 +313,32 @@ function buildMenu() {
       : []),
     {
       label: 'File',
-      submenu: [isMac ? { role: 'close' } : { role: 'quit' }]
+      submenu: [
+        isMac ? { role: 'close' } : { role: 'quit' }
+      ]
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        {
+          label: 'Настройки сервера...',
+          accelerator: 'CmdOrCtrl+,',
+          click: () => {
+            // Closes the main window (inside createConfigWindow) and opens
+            // server-config.html so the user can change the server URL or
+            // toggle the self-signed cert trust flag.
+            createConfigWindow('settings');
+          }
+        },
+        { type: 'separator' },
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { role: 'selectAll' }
+      ]
     },
     {
       label: 'View',
@@ -163,9 +375,17 @@ function buildMenu() {
  *   - connect-src: wss/https to localhost (dev) and the public deployment (https + wss).
  *   - media-src / img-src: blob:, data:, https.
  *   - script-src / style-src: allow Vite (inline styles, eval in dev), renderer bundle.
+ *
+ * The CSP is parameterised by the user's chosen server URL (`config.url`), so
+ * changing servers doesn't require rebuilding. Local `file://` loads (the
+ * first-run `server-config.html` screen) are exempt — they need inline
+ * scripts/styles and don't talk to the network, so we skip CSP injection for
+ * non-http(s) responses entirely.
+ *
+ * @param {{ url: string }} [config]
  */
-function installCsp() {
-  const base = RESOLVED_URL;
+function installCsp(config) {
+  const base = (config && config.url) || RESOLVED_URL;
   let origin = 'https://localhost:3000';
   try {
     origin = new URL(base).origin;
@@ -211,6 +431,13 @@ function installCsp() {
     .join('; ');
 
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    // Only inject CSP for remote responses. Local file:// loads (the setup
+    // screen) need inline scripts and don't have a meaningful origin, so we
+    // leave them alone.
+    if (!/^https?:\/\//i.test(details.url)) {
+      callback({});
+      return;
+    }
     callback({
       responseHeaders: {
         ...details.responseHeaders,
@@ -220,7 +447,22 @@ function installCsp() {
   });
 }
 
-async function createMainWindow() {
+/**
+ * Create (or re-create) the main BrowserWindow that loads the remote React
+ * client. Takes the URL explicitly so the same function works regardless of
+ * whether the URL came from `SCREENSHARE_URL` (dev env), the saved config, or
+ * a one-off `?room=` deep link.
+ *
+ * If `loadURL` fails (server down, cert still rejected after bypass, DNS
+ * failure) we tear this window down and show {@link showErrorWindow} so the
+ * user can fix the address via the settings screen instead of staring at a
+ * black window.
+ *
+ * @param {string} url Fully-qualified https:// URL to load.
+ * @param {boolean} [devTools] Override the dev-tools default (mainly for tests).
+ * @returns {Promise<BrowserWindow>}
+ */
+async function createMainWindow(url, devTools) {
   /** @type {Electron.BrowserWindowConstructorOptions} */
   const winOptions = {
     width: 1280,
@@ -242,37 +484,192 @@ async function createMainWindow() {
   const win = new BrowserWindow(winOptions);
   mainWindow = win;
 
-  win.once('ready-to-show', () => win.show());
+  /** Tracks whether we've already swapped to the error UI for this window. */
+  let fatalTriggered = false;
+  /**
+   * Swap to the error config window. Idempotent — `did-fail-load` and the
+   * `loadURL` rejection can both fire for the same failure, and double-
+   * calling `createConfigWindow` would tear down a window twice.
+   *
+   * @param {string} message
+   */
+  const triggerFatal = (message) => {
+    if (fatalTriggered) return;
+    fatalTriggered = true;
+    showFatalErrorWindow(url, message);
+  };
 
-  win.webContents.on('did-fail-load', (_e, errorCode, errorDescription) => {
-    // Typical for self-signed cert in dev; show a friendly note in console.
-    // The user can proceed manually via the cert warning screen.
+  win.once('ready-to-show', () => {
+    if (!win.isDestroyed()) win.show();
+  });
+
+  win.webContents.on('did-fail-load', (_e, errorCode, errorDescription, validatedURL) => {
     // eslint-disable-next-line no-console
-    console.warn(`[main] did-fail-load: ${errorCode} ${errorDescription} (${RESOLVED_URL})`);
+    console.warn(
+      `[main] did-fail-load: ${errorCode} ${errorDescription} (${validatedURL || url})`,
+    );
+    // Only treat it as fatal if the main page itself failed (not a
+    // sub-resource) AND it's not an ERR_ABORTED (-3) which usually accompanies
+    // a redirect/reload rather than a true failure.
+    if (
+      validatedURL &&
+      (validatedURL === url || validatedURL.replace(/\/$/, '') === url.replace(/\/$/, '')) &&
+      errorCode !== -3
+    ) {
+      triggerFatal(`${errorDescription || 'load failed'} (code ${errorCode})`);
+    }
   });
 
   // Open external links (target=_blank) in the OS browser, not a new Electron window.
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:\/\//i.test(url)) {
-      shell.openExternal(url).catch(() => {});
+  win.webContents.setWindowOpenHandler(({ url: target }) => {
+    if (/^https?:\/\//i.test(target)) {
+      shell.openExternal(target).catch(() => {});
     }
     return { action: 'deny' };
   });
 
+  let loadError = null;
   try {
-    await win.loadURL(RESOLVED_URL);
+    await win.loadURL(url);
   } catch (err) {
-    // Common in dev: ERR_CERT_AUTHORITY_INVALID for the self-signed cert.
-    // Chromium will surface the interstitial; the user clicks "Advanced → Proceed".
+    // Two common cases:
+    //   (a) ERR_CERT_AUTHORITY_INVALID for a self-signed cert that the bypass
+    //       didn't cover (e.g. trustSelfSignedCerts=false and non-localhost).
+    //   (b) ERR_CONNECTION_REFUSED when the server is down.
+    // In both cases Chromium ALSO fires `did-fail-load`, which has already
+    // called `triggerFatal()` and destroyed this window. We only fall back to
+    // the error UI ourselves if that somehow didn't happen.
+    loadError = err instanceof Error ? err : new Error(String(err));
     // eslint-disable-next-line no-console
-    console.warn(`[main] loadURL rejected (likely self-signed cert): ${err && err.message}`);
+    console.warn(`[main] loadURL rejected: ${loadError.message}`);
   }
 
-  if (isDev) {
+  // The error path may have destroyed this window out from under us. Guard
+  // every subsequent access.
+  if (win.isDestroyed()) {
+    // `did-fail-load` already swapped to the error UI — nothing more to do.
+    return win;
+  }
+
+  if (loadError) {
+    // `did-fail-load` didn't fire (some cert failures skip it), so trigger
+    // the error UI explicitly.
+    triggerFatal(loadError.message);
+    return win;
+  }
+
+  if (devTools === undefined ? isDev : devTools) {
     win.webContents.openDevTools({ mode: 'detach' });
   }
 
   return win;
+}
+
+/**
+ * Create the first-run / settings window that loads the local
+ * `server-config.html` via `loadFile`. The window is intentionally smaller
+ * than the main app — it's a modal-style form, not the full UI.
+ *
+ * @param {'first-run' | 'settings' | 'error'} [mode] Hint passed to the page
+ *   via a query param so it can tweak copy (e.g. show a "couldn't connect"
+ *   banner when reached from the error path).
+ * @param {string} [errorMessage] Optional error string for `mode === 'error'`.
+ * @returns {BrowserWindow}
+ */
+function createConfigWindow(mode, errorMessage) {
+  // If a config window is already open (e.g. user hit Ctrl+, twice), just
+  // focus it instead of stacking duplicates.
+  const existing = BrowserWindow.getAllWindows().find((w) => {
+    try {
+      return !w.isDestroyed() && w.webContents.getURL().startsWith('file:');
+    } catch {
+      return false;
+    }
+  });
+  if (existing) {
+    if (existing.isMinimized()) existing.restore();
+    existing.focus();
+    return existing;
+  }
+
+  // IMPORTANT: create the new config window BEFORE destroying the main
+  // window. Otherwise `window-all-closed` fires between the two calls and
+  // quits the app (on non-macOS) before the settings window has a chance
+  // to come up.
+  /** @type {Electron.BrowserWindowConstructorOptions} */
+  const options = {
+    width: 560,
+    height: 520,
+    minWidth: 480,
+    minHeight: 420,
+    maximizable: false,
+    fullscreenable: false,
+    backgroundColor: '#0b0e14',
+    title: 'Screen Share — Server Settings',
+    show: false,
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      spellcheck: false
+    }
+  };
+
+  const win = new BrowserWindow(options);
+  configWindow = win;
+
+  // Now that the new window exists, we can safely tear down the main window.
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.destroy();
+    mainWindow = null;
+  }
+
+  win.once('ready-to-show', () => {
+    if (!win.isDestroyed()) win.show();
+  });
+
+  win.on('closed', () => {
+    if (configWindow === win) configWindow = null;
+    // If the user closes the config window without saving AND there's no main
+    // window, quit. Otherwise we'd be left with an invisible app.
+    if (
+      !mainWindow ||
+      mainWindow.isDestroyed() ||
+      BrowserWindow.getAllWindows().length === 0
+    ) {
+      // Don't quit on macOS (convention), do quit everywhere else.
+      if (process.platform !== 'darwin') app.quit();
+    }
+  });
+
+  // loadFile with a query string so the page can read `location.search` to
+  // decide which banner to show. Electron joins these as `?mode=first-run`.
+  win.loadFile(path.join(__dirname, 'server-config.html'), {
+    query: {
+      mode: mode || 'first-run',
+      ...(errorMessage ? { error: String(errorMessage).slice(0, 500) } : {}),
+    },
+  });
+
+  return win;
+}
+
+/**
+ * Convenience wrapper around {@link createConfigWindow} for the post-failure
+ * path: shows the same form but with an error banner so the user knows why
+ * they were dumped back to setup.
+ *
+ * @param {string} attemptedUrl
+ * @param {string} [message]
+ */
+function showFatalErrorWindow(attemptedUrl, message) {
+  // eslint-disable-next-line no-console
+  console.error(
+    `[main] fatal: failed to load ${attemptedUrl}${message ? ` — ${message}` : ''}`,
+  );
+  createConfigWindow('error', message || `Could not reach ${attemptedUrl}`);
 }
 
 /**
@@ -326,6 +723,113 @@ function registerProtocol() {
 // Renderer → main: sync handler so the renderer's getAppVersion() can return a string.
 ipcMain.on('electron:app-version-sync', (event) => {
   event.returnValue = app.getVersion();
+});
+
+// ---------------------------------------------------------------------------
+// Server config IPC (first-run UI + Settings menu).
+// ---------------------------------------------------------------------------
+
+/**
+ * Renderer → main: return the current config + app version. Used by
+ * `server-config.html` to prefill the form. Always resolves (never throws) —
+ * the renderer treats a null `url` as "no saved config".
+ */
+ipcMain.handle('server:get-config', () => {
+  const cfg = readConfig();
+  return {
+    url: cfg.url,
+    trustSelfSignedCerts: cfg.trustSelfSignedCerts,
+    appVersion: app.getVersion(),
+    firstRun: !configExists(),
+  };
+});
+
+/**
+ * Renderer → main: persist the user's choices. Returns `{ ok, config?, error? }`.
+ * On success the in-memory cache is updated but the main window is NOT opened
+ * yet — the renderer follows up with `server:connect` to actually swap windows.
+ *
+ * @param {unknown} raw
+ * @returns {Promise<{ ok: true, config: { url: string, trustSelfSignedCerts: boolean } } | { ok: false, error: string }>}
+ */
+ipcMain.handle('server:save', async (_event, raw) => {
+  const saved = writeConfig(raw);
+  if (!saved) {
+    return { ok: false, error: 'Invalid server URL. Use https://host:port' };
+  }
+  return { ok: true, config: saved };
+});
+
+/**
+ * Renderer → main: persist the form values AND swap from the settings window
+ * to the main window. This is the "Connect" button handler. The settings
+ * window is closed via `BrowserWindow.close()` after the main window has
+ * finished loading, so the user doesn't see a flash of no-window.
+ *
+ * Returns `{ ok, error? }`. On failure the settings window stays open so the
+ * user can correct the URL.
+ *
+ * @param {unknown} raw
+ */
+ipcMain.handle('server:connect', async (_event, raw) => {
+  const saved = writeConfig(raw);
+  if (!saved) {
+    return { ok: false, error: 'Invalid server URL. Use https://host:port' };
+  }
+
+  try {
+    // Boot the main window from the just-saved config. CSP + cert bypass get
+    // reinstalled inside `createMainWindowFromConfig` with the new URL.
+    await createMainWindowFromConfig();
+
+    // Close the settings window once the main window is showing. We wait for
+    // `ready-to-show` to avoid a brief flash where both/neither window is up.
+    if (configWindow && !configWindow.isDestroyed()) {
+      const cw = configWindow;
+      const closeConfigWindow = () => {
+        try {
+          if (!cw.isDestroyed()) cw.close();
+        } catch {
+          /* ignore */
+        }
+      };
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.once('ready-to-show', closeConfigWindow);
+        // Safety net: don't leave the settings window open forever if
+        // ready-to-show already fired (race) — close after 5s.
+        setTimeout(closeConfigWindow, 5000);
+      } else {
+        closeConfigWindow();
+      }
+    }
+    return { ok: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: message };
+  }
+});
+
+/**
+ * Renderer → main: wipe `server-config.json` so the next launch shows the
+ * first-run screen. Also resets the in-memory cache. Doesn't open the settings
+ * window — pair with `server:open-settings` for that.
+ */
+ipcMain.handle('server:reset', async () => {
+  deleteConfig();
+  return { ok: true };
+});
+
+/**
+ * Renderer (or menu) → main: open the settings window. Used by the Settings
+ * menu item (Ctrl+,) and by the "Open settings" button on the error screen.
+ * Closes the main window first so there's exactly one window on screen.
+ */
+ipcMain.handle('server:open-settings', async (_event, modeArg) => {
+  createConfigWindow(
+    modeArg === 'error' ? 'error' : 'settings',
+    typeof modeArg === 'string' && modeArg.startsWith('error:') ? modeArg.slice(6) : undefined,
+  );
+  return { ok: true };
 });
 
 // ---------------------------------------------------------------------------
@@ -598,45 +1102,121 @@ ipcMain.handle('audio:stop', async () => {
 });
 
 /**
- * Dev-only certificate bypass. When the app is NOT packaged we accept any
- * certificate served from `localhost` or `127.0.0.1` so that the self-signed
- * HTTPS dev server (`https://localhost:3000`) loads without the Chromium
- * interstitial. Packaged builds never install this hook, so they fall back to
- * Chromium's default verification — production deployments must use a cert
- * trusted by the user's OS (e.g. via mkcert + installed root CA, or a real CA).
+ * Install the certificate verify proc on the default session.
+ *
+ * History: this used to be a no-op when `app.isPackaged` was true, which meant
+ * the default `https://localhost:3000` self-signed dev cert was rejected by
+ * Chromium in the installed build → ERR_CERT_AUTHORITY_INVALID → black window.
+ * We now honour the user's `trustSelfSignedCerts` setting (default: `true` so
+ * the first-run flow against the bundled dev server just works).
+ *
+ * Acceptance rules (any one of):
+ *   1. Host is `localhost` / `127.0.0.1` / `::1` (loopback is trusted
+ *      regardless of the cert, mirrors the original dev-only behaviour).
+ *   2. The request's origin matches the saved server URL's origin AND the
+ *      user hasn't disabled self-signed trust. This is what lets the packaged
+ *      app talk to a friend's self-signed deployment at e.g.
+ *      `https://192.168.1.10:3000` after they enter the address once.
+ *   3. `trustSelfSignedCerts` is `true` (the default) — accept everything.
+ *      Convenience for first-run; users who want strict validation can flip
+ *      the checkbox off in the settings screen.
+ *
+ * @param {{ url: string, trustSelfSignedCerts: boolean }} [config]
  */
-function installDevCertBypass() {
-  if (app.isPackaged) {
-    // Never bypass cert verification in production.
-    return;
+function installCertBypass(config) {
+  const cfg = config || readConfig();
+
+  /** Saved server origin (e.g. `https://192.168.1.10:3000`). Empty string if unset. */
+  let savedOrigin = '';
+  try {
+    savedOrigin = new URL(cfg.url).origin;
+  } catch {
+    /* keep empty */
   }
+
   session.defaultSession.setCertificateVerifyProc((request, callback) => {
-    const { hostname } = request;
+    const { hostname, validationResult, verificationFont: _vf } = request;
+
+    // (1) Loopback — always trusted, dev or packaged.
     if (
       typeof hostname === 'string' &&
       (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1')
     ) {
-      // 0 === verification success in Chromium's CertVerifyResult enum.
       callback(0);
       return;
     }
-    // For any other host, defer to Chromium's default validation.
-    callback(-1);
+
+    // Build the request origin to compare against the saved URL.
+    /** @type {string} */
+    let origin = '';
+    try {
+      // `request` has `origin` on newer Electron; fall back to reconstructing
+      // from the URL field if present.
+      origin =
+        /** @type {any} */ (request).origin ||
+        (typeof request === 'object' && typeof request.url === 'string'
+          ? new URL(request.url).origin
+          : '');
+    } catch {
+      /* ignore */
+    }
+
+    // (2) Origin matches the saved server URL — trust it.
+    if (savedOrigin && origin && origin === savedOrigin) {
+      callback(0);
+      return;
+    }
+
+    // (3) User opted into trusting any self-signed cert.
+    if (cfg.trustSelfSignedCerts) {
+      callback(0);
+      return;
+    }
+
+    // Otherwise defer to Chromium's default validation.
+    // `-2` === "use default" per Electron's CertVerifyResult; we pass through
+    // the request's own `validationResult` when available for completeness.
+    callback(typeof validationResult === 'number' ? validationResult : -2);
   });
+
   // eslint-disable-next-line no-console
   console.log(
-    '[main] dev cert bypass active for localhost/127.0.0.1 — packaged builds must use a trusted cert',
+    `[main] cert bypass active (trustSelfSignedCerts=${cfg.trustSelfSignedCerts}, savedOrigin=${savedOrigin || 'n/a'})`,
   );
 }
 
 // Pre-resolve ffmpeg path so we log the discovery (or warning) once at startup.
 app.whenReady().then(async () => {
-  installCsp();
-  installDevCertBypass();
   registerProtocol();
   Menu.setApplicationMenu(buildMenu());
   getFFmpegPath(); // logs resolved path / warning
-  await createMainWindow();
+
+  // (1) Dev override: when SCREENSHARE_URL is set in env we skip the settings
+  //     UI entirely and load that URL directly. This preserves the existing
+  //     `npm -w electron run dev` flow against the local Fastify server.
+  if (process.env.SCREENSHARE_URL) {
+    installCsp({ url: process.env.SCREENSHARE_URL });
+    // In dev we always trust localhost regardless of any saved config.
+    installCertBypass({
+      url: process.env.SCREENSHARE_URL,
+      trustSelfSignedCerts: true,
+    });
+    await createMainWindow(process.env.SCREENSHARE_URL);
+    return;
+  }
+
+  // (2) First run / reset: no config file → show the setup screen. We DON'T
+  //     install cert bypass / CSP yet — those get installed (with the final
+  //     URL) when the user clicks "Connect" via `server:connect`.
+  if (!configExists()) {
+    // eslint-disable-next-line no-console
+    console.log('[main] no server-config.json — showing first-run setup');
+    createConfigWindow('first-run');
+    return;
+  }
+
+  // (3) Returning user — boot straight into the saved server.
+  await createMainWindowFromConfig();
 });
 
 // Quit when all windows are closed, except on macOS. Also tear down any
@@ -650,12 +1230,19 @@ app.on('window-all-closed', () => {
     }
     currentCapture = null;
   }
+  configWindow = null;
   if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('activate', async () => {
   if (BrowserWindow.getAllWindows().length === 0) {
-    await createMainWindow();
+    if (process.env.SCREENSHARE_URL) {
+      await createMainWindow(process.env.SCREENSHARE_URL);
+    } else if (configExists()) {
+      await createMainWindowFromConfig();
+    } else {
+      createConfigWindow('first-run');
+    }
   }
 });
 

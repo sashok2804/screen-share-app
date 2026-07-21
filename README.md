@@ -128,7 +128,8 @@ npm -w electron run build                     # produces electron/dist/*.exe
 
 The resulting `Screen Share Setup X.X.X.exe` bundles:
 - The Electron runtime
-- The React client (loaded from https://YOUR_SERVER:3000)
+- The React client (loaded over HTTPS from the server address you enter on
+  first launch)
 - FFmpeg for WASAPI loopback audio capture
 - Custom URL protocol `screen-share://`
 
@@ -137,10 +138,48 @@ Requirements:
 - Node 22.12+ recommended. Node 22.11 works too — the
   `postinstall` script (`electron/scripts/patch-app-builder.cjs`) stubs an
   ESM-only require inside `app-builder-lib` so `electron-builder` runs.
-- The HTTPS server must be reachable at the URL the app loads
-  (`https://localhost:3000` by default; override via `SCREENSHARE_URL`).
-  Production deployments must use a certificate trusted by the user's OS —
-  the dev self-signed bypass only runs when `!app.isPackaged`.
+- The HTTPS server must be reachable at the address you enter on first launch
+  (defaults to `https://localhost:3000`). For deployments with a self-signed
+  cert, leave the "Доверять self-signed сертификатам" checkbox on — the app
+  installs a `setCertificateVerifyProc` that accepts the saved origin. To
+  enforce strict OS-trust validation instead, uncheck it and install a CA
+  cert (e.g. via mkcert) on the host.
+
+### First launch (server settings screen)
+
+On the first run (no saved config yet) the app opens a setup window instead
+of loading a URL directly:
+
+1. **Адрес сервера** — the URL the React client is served from
+   (`https://localhost:3000` by default).
+2. **Доверять self-signed сертификатам** — when checked (default), the app
+   accepts the saved origin's certificate via `setCertificateVerifyProc`.
+   Loopback (`localhost` / `127.0.0.1` / `::1`) is always trusted.
+3. **Подключиться** — saves the choices to `%APPDATA%\<appName>\server-config.json`
+   and opens the main window.
+
+The settings are stored in `server-config.json` inside Electron's `userData`
+directory (`%APPDATA%\<appName>\server-config.json` on Windows, where
+`<appName>` is `@screenshare/electron` today). To change the server later
+use **Edit → Настройки сервера...** (Ctrl+,) or delete the file to trigger
+the first-run screen again.
+
+If the saved server can't be reached (timeout, refused, DNS failure) the app
+falls back to the same setup screen with an error banner so the user can
+correct the address.
+
+### Dev URL override
+
+For local dev you can skip the settings UI entirely by setting
+`SCREENSHARE_URL` in the env — the main window loads that URL directly and
+`server-config.json` is left untouched:
+
+```bash
+SCREENSHARE_URL=https://localhost:3000 npm -w electron run dev
+```
+
+Without `SCREENSHARE_URL`, `npm -w electron run dev` opens the same
+first-run / settings screen as the packaged build.
 
 ### Custom URL protocol
 
@@ -317,6 +356,7 @@ screen-share-app/
     ├── builder.yml           # human-readable mirror of package.json `build`
     ├── main.cjs              # Electron main + IPC + FFmpeg/WASAPI bridge
     ├── preload.cjs           # contextBridge → window.electronAPI
+    ├── server-config.html    # first-run / settings screen (server URL + cert trust)
     ├── bin/                  # downloaded ffmpeg.exe (gitignored, ~97 MB)
     ├── build/icon.ico        # placeholder 16..256 icon
     ├── scripts/

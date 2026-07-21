@@ -162,5 +162,68 @@ contextBridge.exposeInMainWorld('electronAPI', {
     };
     ipcRenderer.on('audio:error', handler);
     return () => ipcRenderer.removeListener('audio:error', handler);
+  },
+
+  // ---- Server config (first-run UI + Settings menu) ---------------------
+
+  /**
+   * Read the saved server config from `server-config.json`. Returned shape is
+   * always stable; `url` is the default `https://localhost:3000` when no file
+   * exists yet.
+   *
+   * @returns {Promise<{ url: string, trustSelfSignedCerts: boolean, appVersion: string, firstRun: boolean }>}
+   */
+  getServerConfig: async () => {
+    const result = await ipcRenderer.invoke('server:get-config');
+    return {
+      url: typeof result?.url === 'string' ? result.url : 'https://localhost:3000',
+      trustSelfSignedCerts: result?.trustSelfSignedCerts !== false,
+      appVersion: typeof result?.appVersion === 'string' ? result.appVersion : '',
+      firstRun: result?.firstRun === true,
+    };
+  },
+
+  /**
+   * Persist the config WITHOUT opening the main window. Useful when the user
+   * wants to save without immediately connecting, or for tests.
+   *
+   * @param {{ url: string, trustSelfSignedCerts?: boolean }} config
+   * @returns {Promise<{ ok: true, config: { url: string, trustSelfSignedCerts: boolean } } | { ok: false, error: string }>}
+   */
+  saveServerConfig: async (config) => {
+    return await ipcRenderer.invoke('server:save', config);
+  },
+
+  /**
+   * Persist the config AND swap from the settings window to the main window.
+   * This is the "Connect" button handler in `server-config.html`. The settings
+   * window is closed by the main process after the main window has loaded.
+   *
+   * @param {{ url: string, trustSelfSignedCerts?: boolean }} config
+   * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
+   */
+  connectToServer: async (config) => {
+    return await ipcRenderer.invoke('server:connect', config);
+  },
+
+  /**
+   * Wipe `server-config.json`. The next launch will show the first-run UI.
+   * Doesn't change the currently-open window.
+   *
+   * @returns {Promise<{ ok: boolean }>}
+   */
+  resetServerConfig: async () => {
+    return await ipcRenderer.invoke('server:reset');
+  },
+
+  /**
+   * Open the settings window (closes the main window first). Optional `mode`
+   * of 'error' renders the form with an error banner.
+   *
+   * @param {'settings' | 'error' | string} [mode]
+   * @returns {Promise<{ ok: boolean }>}
+   */
+  openServerSettings: async (mode) => {
+    return await ipcRenderer.invoke('server:open-settings', mode);
   }
 });
