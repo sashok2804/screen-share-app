@@ -165,7 +165,15 @@ export function useScreenShare(
           // This is what prevents the remote peer from hearing themselves via
           // our system loopback.
           const reference = getRemoteAudioStream();
-          const publishedTrack = aec.process(audioTrack, reference) ?? audioTrack;
+          console.debug('[screen-share] audio track captured', {
+            hasReference: !!reference,
+            referenceTracks: reference?.getAudioTracks().length ?? 0,
+            aecEnabled: aec.enabled,
+          });
+          const publishedTrack = (await aec.process(audioTrack, reference)) ?? audioTrack;
+          console.debug('[screen-share] using track', {
+            processed: publishedTrack !== audioTrack,
+          });
           audioTrackRef.current = audioTrack; // keep raw track for cleanup
           mesh.publishAudio(publishedTrack);
         }

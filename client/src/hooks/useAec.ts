@@ -8,42 +8,66 @@ export interface UseAecResult {
   /**
    * Run a captured system-audio track through the AEC graph, using
    * `referenceStream` (the remote peer voices) as the cancellation reference.
-   * Returns the cleaned MediaStream that should be published instead of the
-   * raw capture. Returns null if AEC is disabled or unavailable.
+   * Returns the cleaned MediaStreamTrack that should be published instead of
+   * the raw capture. Returns null if AEC is disabled or the graph could not
+   * be built (caller should fall back to the raw capture in that case).
    *
-   * Reference MUST be the same stream that the local <audio> element is
-   * playing — i.e. what is leaking into the system loopback via the speakers.
+   * ASYNC: this waits for the AudioContext + worklet module to be ready
+   * (which may take ~50-200 ms on first call).
    */
   process: (
     capture: MediaStreamTrack,
     referenceStream: MediaStream | null,
-  ) => MediaStreamTrack | null;
+  ) => Promise<MediaStreamTrack | null>;
   /** Tear down the AEC graph (called automatically on unmount). */
   dispose: () => void;
   /** Last error encountered while building the graph. */
   error: string | null;
 }
 
+// ─── Module-singleton AudioContext (shared across all hooks) ────────────────
+
 let sharedCtx: AudioContext | null = null;
+let sharedCtxPromise: Promise<AudioContext> | null = null;
+
 async function getSharedAudioContext(): Promise<AudioContext> {
-  if (!sharedCtx) {
+  if (sharedCtx) return sharedCtx;
+  if (sharedCtxPromise) return sharedCtxPromise;
+
+  sharedCtxPromise = (async () => {
     const Ctor =
       window.AudioContext ??
       (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!Ctor) throw new Error('Web Audio API not supported');
-    sharedCtx = new Ctor();
-  }
-  if (sharedCtx.state === 'suspended') {
-    await sharedCtx.resume();
-  }
-  return sharedCtx;
+    const ctx = new Ctor();
+    if (ctx.state === 'suspended') {
+      // May reject if no user gesture yet — caller should handle gracefully.
+      try {
+        await ctx.resume();
+      } catch {
+        /* will retry on next call */
+      }
+    }
+    sharedCtx = ctx;
+    return ctx;
+  })();
+
+  return sharedCtxPromise;
 }
 
 let workletLoaded = false;
+let workletLoadPromise: Promise<void> | null = null;
+
 async function ensureWorklet(ctx: AudioContext): Promise<void> {
   if (workletLoaded) return;
-  await ctx.audioWorklet.addModule(new URL('../workers/aec-worklet.js', import.meta.url));
-  workletLoaded = true;
+  if (workletLoadPromise) return workletLoadPromise;
+
+  workletLoadPromise = (async () => {
+    await ctx.audioWorklet.addModule(new URL('../workers/aec-worklet.js', import.meta.url));
+    workletLoaded = true;
+  })();
+
+  return workletLoadPromise;
 }
 
 /**
@@ -67,6 +91,7 @@ export function useAec(): UseAecResult {
     referenceSource: MediaStreamAudioSourceNode;
     worklet: AudioWorkletNode;
     destination: MediaStreamAudioDestinationNode;
+    referenceTrackListener?: () => void;
   } | null>(null);
 
   const setEnabled = useCallback((next: boolean) => {
@@ -74,7 +99,10 @@ export function useAec(): UseAecResult {
   }, []);
 
   const process = useCallback(
-    (capture: MediaStreamTrack, referenceStream: MediaStream | null): MediaStreamTrack | null => {
+    async (
+      capture: MediaStreamTrack,
+      referenceStream: MediaStream | null,
+    ): Promise<MediaStreamTrack | null> => {
       // If disabled, just pass the raw capture through.
       if (!enabled) return capture;
       if (!referenceStream) {
@@ -86,14 +114,12 @@ export function useAec(): UseAecResult {
       disposeNodes();
 
       try {
-        // We need a synchronous AudioContext handle here; if it isn't ready
-        // yet, fall back to the raw capture for this session.
-        if (!sharedCtx) {
-          // Kick off async creation for next time.
-          void getSharedAudioContext().then(() => ensureWorklet(sharedCtx!));
-          return capture;
+        const ctx = await getSharedAudioContext();
+        // Resume in case the context was suspended (e.g. after tab switch).
+        if (ctx.state === 'suspended') {
+          await ctx.resume();
         }
-        const ctx = sharedCtx;
+        await ensureWorklet(ctx);
 
         const captureStream = new MediaStream([capture]);
         const referenceTracks = referenceStream.getAudioTracks();
@@ -113,12 +139,32 @@ export function useAec(): UseAecResult {
         const destination = ctx.createMediaStreamDestination();
         worklet.connect(destination);
 
-        nodesRef.current = { ctx, captureSource, referenceSource, worklet, destination };
+        // If the reference track ends (peer leaves), rebuild without it.
+        const referenceTrack = referenceTracks[0];
+        const onReferenceEnded = () => {
+          // Lightweight: just disconnect the reference input.
+          try {
+            referenceSource.disconnect();
+          } catch {
+            /* already gone */
+          }
+        };
+        referenceTrack.addEventListener('ended', onReferenceEnded);
+
+        nodesRef.current = {
+          ctx,
+          captureSource,
+          referenceSource,
+          worklet,
+          destination,
+          referenceTrackListener: onReferenceEnded,
+        };
 
         const cleanedTrack = destination.stream.getAudioTracks()[0];
         return cleanedTrack ?? capture;
       } catch (err) {
         const message = err instanceof Error ? err.message : 'AEC graph build failed';
+        console.warn('[aec] falling back to raw capture:', message);
         setError(message);
         return capture; // graceful fallback
       }
@@ -129,6 +175,14 @@ export function useAec(): UseAecResult {
   const disposeNodes = useCallback(() => {
     const nodes = nodesRef.current;
     if (!nodes) return;
+    try {
+      if (nodes.referenceTrackListener && nodes.referenceSource.mediaStream) {
+        const t = nodes.referenceSource.mediaStream.getAudioTracks()[0];
+        t?.removeEventListener('ended', nodes.referenceTrackListener);
+      }
+    } catch {
+      /* ignore */
+    }
     try {
       nodes.captureSource.disconnect();
       nodes.referenceSource.disconnect();
@@ -144,15 +198,21 @@ export function useAec(): UseAecResult {
     disposeNodes();
   }, [disposeNodes]);
 
-  // Ensure the AudioContext + worklet are preloaded in the background so that
-  // the synchronous `process()` call has them ready when needed.
+  // Preload the AudioContext + worklet in the background so that the first
+  // real `process()` call is fast.
   useEffect(() => {
-    void getSharedAudioContext()
+    let cancelled = false;
+    getSharedAudioContext()
       .then((ctx) => ensureWorklet(ctx))
       .catch((err) => {
+        if (cancelled) return;
         const message = err instanceof Error ? err.message : 'Audio worklet init failed';
+        console.warn('[aec] preload failed:', message);
         setError(message);
       });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
