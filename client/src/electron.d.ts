@@ -2,11 +2,9 @@
  * Ambient types for the `window.electronAPI` surface exposed by the Electron
  * preload script (see `electron/preload.cjs`).
  *
- * `isElectron`, `getAppVersion()`, `onOpenRoom()`, `getSources()` and
- * `getSourceMetadata()` are implemented (Phases 1 + 2). The remaining members
- * are declared so the renderer code can be written against the final shape;
- * they are optional and resolve to `undefined` until Phase 3 lands.
+ * Phases 1, 2 and 3 are all implemented (source picker + FFmpeg audio bridge).
  */
+
 export {};
 
 /** A capturable desktop source as returned by `electronAPI.getSources()`. */
@@ -20,6 +18,39 @@ export interface ElectronSource {
   thumbnailDataURL: string;
   /** `data:image/png;base64,...` app icon for window sources, or null. */
   appIconDataURL?: string | null;
+}
+
+/** Result of `startProcessAudio` on success. */
+export interface ProcessAudioStartOk {
+  ok: true;
+  sampleRate: number;
+  channels: number;
+}
+/** Result of `startProcessAudio` on failure. */
+export interface ProcessAudioStartErr {
+  ok: false;
+  error: string;
+}
+export type ProcessAudioStartResult = ProcessAudioStartOk | ProcessAudioStartErr;
+
+/** Options accepted by `startProcessAudio`. */
+export interface StartProcessAudioOptions {
+  /** DShow/WASAPI device name; empty = FFmpeg default input. */
+  deviceName?: string;
+  /** Output sample rate. Default 48000. */
+  sampleRate?: number;
+  /** Output channel count. Default 2. */
+  channels?: number;
+  /** Input format. Default 'dshow'. */
+  format?: 'dshow' | 'wasapi';
+}
+
+/** Result of `listAudioDevices`. */
+export interface ListAudioDevicesResult {
+  audio: string[];
+  video: string[];
+  /** `false` if FFmpeg was not found on the system. */
+  ffmpegFound: boolean;
 }
 
 declare global {
@@ -45,12 +76,22 @@ declare global {
       getSourceMetadata?: (sourceId: string) => Promise<{ name: string } | null>;
 
       // ---- Phase 3: FFmpeg WASAPI bridge ----------------------------------
-      listAudioDevices?: () => Promise<string[]>;
+      /** Lists DirectShow audio/video devices. */
+      listAudioDevices?: () => Promise<ListAudioDevicesResult>;
+
+      /** Start FFmpeg audio capture from the named (or default) device. */
       startProcessAudio?: (
-        deviceName: string
-      ) => Promise<{ ok: boolean; sampleRate: number; channels: number }>;
-      stopProcessAudio?: () => Promise<void>;
-      onAudioChunk?: (callback: (chunk: Float32Array) => void) => void;
+        opts?: StartProcessAudioOptions
+      ) => Promise<ProcessAudioStartResult>;
+
+      /** Stop the active capture. */
+      stopProcessAudio?: () => Promise<{ ok: boolean }>;
+
+      /** Subscribe to audio chunks (Float32Array). Returns an unsubscribe. */
+      onAudioChunk?: (callback: (chunk: Float32Array) => void) => () => void;
+
+      /** Subscribe to mid-capture hard errors. Returns an unsubscribe. */
+      onAudioError?: (callback: (err: { message: string }) => void) => () => void;
     };
   }
 }

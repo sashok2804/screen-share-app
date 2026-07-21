@@ -20,6 +20,11 @@
 const { app, BrowserWindow, session, Menu, shell, ipcMain, desktopCapturer } = require('electron');
 
 const path = require('path');
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+
+const { listDirectShowAudioDevices } = require('./src/dshow-devices.cjs');
+const { FFmpegAudioCapture } = require('./src/ffmpeg-bridge.cjs');
 
 /**
  * Default URL of the React client. In dev this is the Vite dev server proxied through
@@ -378,15 +383,229 @@ ipcMain.handle(
   },
 );
 
+// ---------------------------------------------------------------------------
+// Phase 3 — FFmpeg WASAPI / DirectShow loopback audio bridge.
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the path to the ffmpeg executable, checking (in order):
+ *   1. `SCREENSHARE_FFMPEG` env var (full path).
+ *   2. Bundled binary: `<resourcesPath>/ffmpeg.exe` if packaged, or
+ *      `<electronDir>/bin/ffmpeg.exe` in dev.
+ *   3. System PATH via `where ffmpeg` (Windows) / `which ffmpeg` (other).
+ *
+ * Returns the resolved absolute path, or `null` if no ffmpeg is available.
+ * The result is cached so we don't spawn `where` on every IPC call.
+ *
+ * @returns {string | null}
+ */
+let cachedFFmpegPath = undefined; // undefined = not-yet-resolved
+function getFFmpegPath() {
+  if (cachedFFmpegPath !== undefined) return cachedFFmpegPath;
+
+  /** @type {string | null} */
+  let resolved = null;
+
+  // (1) Env var override.
+  const envPath = process.env.SCREENSARE_FFMPEG || process.env.SCREENSHARE_FFMPEG;
+  if (envPath && fs.existsSync(envPath)) {
+    resolved = path.resolve(envPath);
+  }
+
+  // (2) Bundled binary.
+  if (!resolved) {
+    try {
+      const bundled = app.isPackaged
+        ? path.join(process.resourcesPath, 'ffmpeg.exe')
+        : path.join(__dirname, 'bin', 'ffmpeg.exe');
+      if (fs.existsSync(bundled)) resolved = bundled;
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[ffmpeg] bundle path check failed:', err);
+    }
+  }
+
+  // (3) System PATH as last resort.
+  if (!resolved) {
+    try {
+      const finder = process.platform === 'win32' ? 'where' : 'which';
+      const result = spawnSync(finder, ['ffmpeg'], { windowsHide: true });
+      if (result.status === 0) {
+        const lines = (result.stdout?.toString('utf8') || '')
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean);
+        if (lines.length > 0 && fs.existsSync(lines[0])) {
+          resolved = lines[0];
+        }
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[ffmpeg] PATH lookup failed:', err);
+    }
+  }
+
+  if (resolved) {
+    // eslint-disable-next-line no-console
+    console.log(`[ffmpeg] resolved path: ${resolved}`);
+  } else {
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[ffmpeg] no ffmpeg.exe found (set SCREENSHARE_FFMPEG, bundle bin/ffmpeg.exe, or install system-wide). Audio capture will be unavailable.',
+    );
+  }
+
+  cachedFFmpegPath = resolved;
+  return resolved;
+}
+
+/**
+ * Currently active FFmpegAudioCapture instance (one at a time per window).
+ * @type {FFmpegAudioCapture | null}
+ */
+let currentCapture = null;
+
+/**
+ * IPC: list available DShow audio devices. Always returns a stable shape;
+ * `{ audio: string[], video: string[], raw: string, ffmpegFound: boolean }`.
+ */
+ipcMain.handle('audio:listDevices', async () => {
+  const ffmpegPath = getFFmpegPath();
+  if (!ffmpegPath) {
+    return { audio: [], video: [], raw: '', ffmpegFound: false };
+  }
+  try {
+    const result = await listDirectShowAudioDevices({ ffmpegPath });
+    return { ...result, ffmpegFound: true };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[main] audio:listDevices failed:', err);
+    return { audio: [], video: [], raw: '', ffmpegFound: true };
+  }
+});
+
+/**
+ * IPC: start capturing system audio from the named device.
+ *
+ * @param {unknown} _event
+ * @param {unknown} rawOpts
+ * @returns {Promise<{ ok: true, sampleRate: number, channels: number } | { ok: false, error: string }>}
+ */
+ipcMain.handle('audio:start', async (_event, rawOpts) => {
+  try {
+    // Stop any prior capture — only one live stream per window.
+    if (currentCapture) {
+      try {
+        currentCapture.stop();
+      } catch {
+        /* ignore */
+      }
+      currentCapture = null;
+    }
+
+    const ffmpegPath = getFFmpegPath();
+    if (!ffmpegPath) {
+      return { ok: false, error: 'ffmpeg not found' };
+    }
+    if (process.platform !== 'win32') {
+      return { ok: false, error: 'audio capture is Windows-only' };
+    }
+
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return { ok: false, error: 'main window not available' };
+    }
+
+    /** @type {{ deviceName?: string, sampleRate?: number, channels?: number, format?: 'dshow'|'wasapi' }} */
+    const opts =
+      rawOpts && typeof rawOpts === 'object'
+        ? /** @type {any} */ (rawOpts)
+        : {};
+
+    const deviceName = typeof opts.deviceName === 'string' ? opts.deviceName : '';
+    const sampleRate = Math.floor(opts.sampleRate || 48000);
+    const channels = Math.floor(opts.channels || 2);
+    const format = opts.format === 'wasapi' ? 'wasapi' : 'dshow';
+
+    const capture = new FFmpegAudioCapture({
+      ffmpegPath,
+      deviceName,
+      sampleRate,
+      channels,
+      format,
+      tryWasapiFallback: true,
+    });
+
+    // Forward chunks to the renderer. Float32Array is structured-cloneable so
+    // we can ship it directly. If the window is destroyed mid-capture we just
+    // stop forwarding.
+    capture.on('chunk', (/** @type {Float32Array} */ chunk) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('audio:chunk', chunk);
+      }
+    });
+    capture.on('warn', (/** @type {string} */ line) => {
+      // eslint-disable-next-line no-console
+      console.warn(`[ffmpeg] ${line}`);
+    });
+    capture.on('error', (/** @type {Error} */ err) => {
+      // eslint-disable-next-line no-console
+      console.error('[ffmpeg] capture error:', err.message);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('audio:error', { message: err.message });
+      }
+    });
+    capture.on('exit', (code, signal) => {
+      // eslint-disable-next-line no-console
+      console.log(`[ffmpeg] process exited (code=${code} signal=${signal})`);
+    });
+
+    await capture.start();
+    currentCapture = capture;
+    return { ok: true, sampleRate, channels };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // eslint-disable-next-line no-console
+    console.error('[main] audio:start failed:', message);
+    return { ok: false, error: message };
+  }
+});
+
+/**
+ * IPC: stop the current capture (if any).
+ */
+ipcMain.handle('audio:stop', async () => {
+  try {
+    if (currentCapture) {
+      currentCapture.stop();
+      currentCapture = null;
+    }
+    return { ok: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: message };
+  }
+});
+
+// Pre-resolve ffmpeg path so we log the discovery (or warning) once at startup.
 app.whenReady().then(async () => {
   installCsp();
   registerProtocol();
   Menu.setApplicationMenu(buildMenu());
+  getFFmpegPath(); // logs resolved path / warning
   await createMainWindow();
 });
 
-// Quit when all windows are closed, except on macOS.
+// Quit when all windows are closed, except on macOS. Also tear down any
+// running FFmpeg capture so we don't leak orphaned subprocesses.
 app.on('window-all-closed', () => {
+  if (currentCapture) {
+    try {
+      currentCapture.stop();
+    } catch {
+      /* ignore */
+    }
+    currentCapture = null;
+  }
   if (process.platform !== 'darwin') app.quit();
 });
 
@@ -400,5 +619,6 @@ app.on('activate', async () => {
 module.exports = {
   parseScreenShareUrl,
   DEFAULT_URL,
-  RESOLVED_URL
+  RESOLVED_URL,
+  getFFmpegPath,
 };

@@ -15,8 +15,15 @@
  *     source. The main process caches the last list so this call is cheap and
  *     does not re-query the OS.
  *
- * TODO: Phase 3 — expose FFmpeg WASAPI bridge (listAudioDevices, startProcessAudio,
- *                 stopProcessAudio, onAudioChunk).
+ * Phase 3 adds the FFmpeg WASAPI / DirectShow bridge:
+ *   - listAudioDevices(): returns `{ audio: string[], video: string[], ffmpegFound: boolean }`.
+ *   - startProcessAudio({ deviceName?, sampleRate?, channels? }): starts the
+ *     subprocess and returns `{ ok, sampleRate, channels }` or `{ ok:false, error }`.
+ *   - stopProcessAudio(): tears down the subprocess.
+ *   - onAudioChunk(cb): subscribes to `audio:chunk` events (Float32Array payload).
+ *     Returns an unsubscribe function.
+ *   - onAudioError(cb): optional diagnostic subscription for hard failures
+ *     that arrive mid-capture (after start() has already resolved).
  */
 
 'use strict';
@@ -75,5 +82,85 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getSourceMetadata: async (sourceId) => {
     if (typeof sourceId !== 'string' || sourceId.length === 0) return null;
     return await ipcRenderer.invoke('desktop-capturer:getSourceMetadata', sourceId);
+  },
+
+  // ---- Phase 3: FFmpeg WASAPI / DirectShow bridge ------------------------
+
+  /**
+   * List available DirectShow audio + video input devices via FFmpeg.
+   * Returns an empty list (with `ffmpegFound:false`) when no FFmpeg is
+   * available — the renderer should treat that as "audio capture disabled".
+   *
+   * @returns {Promise<{ audio: string[], video: string[], ffmpegFound: boolean }>}
+   */
+  listAudioDevices: async () => {
+    const result = await ipcRenderer.invoke('audio:listDevices');
+    return {
+      audio: Array.isArray(result?.audio) ? result.audio : [],
+      video: Array.isArray(result?.video) ? result.video : [],
+      ffmpegFound: result?.ffmpegFound !== false,
+    };
+  },
+
+  /**
+   * Start capturing raw f32le PCM from the named device. If `deviceName` is
+   * omitted/empty, FFmpeg opens its default input. Resolves once the first
+   * audio data has arrived.
+   *
+   * @param {{ deviceName?: string, sampleRate?: number, channels?: number, format?: 'dshow'|'wasapi' }} [opts]
+   * @returns {Promise<{ ok: true, sampleRate: number, channels: number } | { ok: false, error: string }>}
+   */
+  startProcessAudio: async (opts) => {
+    return await ipcRenderer.invoke('audio:start', opts || {});
+  },
+
+  /**
+   * Stop the active capture. Always resolves to `{ ok: true }`.
+   * @returns {Promise<{ ok: boolean }>}
+   */
+  stopProcessAudio: async () => {
+    return await ipcRenderer.invoke('audio:stop');
+  },
+
+  /**
+   * Subscribe to raw audio chunks (Float32Array) emitted by the FFmpeg
+   * subprocess. Returns an unsubscribe function.
+   *
+   * @param {(chunk: Float32Array) => void} callback
+   * @returns {() => void}
+   */
+  onAudioChunk: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const handler = (_event, chunk) => {
+      try {
+        callback(chunk);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[preload] onAudioChunk callback threw:', err);
+      }
+    };
+    ipcRenderer.on('audio:chunk', handler);
+    return () => ipcRenderer.removeListener('audio:chunk', handler);
+  },
+
+  /**
+   * Subscribe to mid-capture hard errors (e.g. FFmpeg crashed after start).
+   * Returns an unsubscribe function.
+   *
+   * @param {(err: { message: string }) => void} callback
+   * @returns {() => void}
+   */
+  onAudioError: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const handler = (_event, payload) => {
+      try {
+        callback(payload || { message: 'unknown audio error' });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[preload] onAudioError callback threw:', err);
+      }
+    };
+    ipcRenderer.on('audio:error', handler);
+    return () => ipcRenderer.removeListener('audio:error', handler);
   }
 });

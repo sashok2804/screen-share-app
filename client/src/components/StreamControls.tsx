@@ -14,6 +14,11 @@ export interface StreamControlsProps {
   aecEnabled?: boolean;
   /** Toggle AEC. */
   onToggleAec?: (next: boolean) => void;
+  /**
+   * Phase 3 — `true` when system audio is captured via the Electron FFmpeg /
+   * WASAPI bridge (no browser fallback path, no echo loop).
+   */
+  audioViaFfmpeg?: boolean;
 }
 
 export function StreamControls({
@@ -26,6 +31,7 @@ export function StreamControls({
   effective,
   errorMessage,
   aecEnabled,
+  audioViaFfmpeg,
 }: StreamControlsProps) {
   if (!isHost) {
     return (
@@ -106,7 +112,17 @@ export function StreamControls({
             </div>
           )}
 
-          {effective?.hasAudio && aecEnabled !== undefined && (
+          {effective?.hasAudio && audioViaFfmpeg && (
+            <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-300/90">
+              <div className="font-medium">Звук через FFmpeg (WASAPI)</div>
+              <div className="mt-0.5 text-[10px] text-emerald-300/70">
+                Системный звук захватывается напрямую через FFmpeg без эха, без
+                loopback-петли, как в браузере.
+              </div>
+            </div>
+          )}
+
+          {!audioViaFfmpeg && effective?.hasAudio && aecEnabled !== undefined && (
             <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-300/90">
               <div className="font-medium">Звук захвачен с системным loopback</div>
               <div className="mt-0.5 text-[10px] text-amber-300/70">

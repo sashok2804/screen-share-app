@@ -221,6 +221,7 @@ export function Room({ roomId, name, onLeave }: RoomProps) {
             errorMessage={screen.error}
             aecEnabled={screen.aecEnabled}
             onToggleAec={screen.setAecEnabled}
+            audioViaFfmpeg={screen.audioViaFfmpeg}
           />
         </div>
 

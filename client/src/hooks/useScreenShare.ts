@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { UseMeshResult } from './useMesh';
 import type { UseRoomResult } from './useRoom';
+import { useProcessAudio } from './useProcessAudio';
 import {
   getPreset,
   toDisplayMediaVideoConstraints,
@@ -37,6 +38,16 @@ export interface UseScreenShareResult {
   /** AEC toggle for the system-audio capture. */
   aecEnabled: boolean;
   setAecEnabled: (next: boolean) => void;
+
+  // ---- Phase 3: FFmpeg audio --------------------------------------------
+  /** True when we are running inside Electron (so the UI can show hints). */
+  isElectron: boolean;
+  /**
+   * True when system audio is being captured via the FFmpeg/WASAPI bridge
+   * (Electron-only). When true the `hasAudio` flag on `stream` reflects that
+   * audio, and the existing system-loopback AEC path should NOT activate.
+   */
+  audioViaFfmpeg: boolean;
 
   // ---- Phase 2: Electron source picker ---------------------------------
   /**
@@ -82,6 +93,13 @@ export function useScreenShare(
   // Reserved for the Electron desktop client, where a real process-loopback
   // capture will replace the system-audio path. Unused in the web build.
   void getRemoteAudioStream;
+
+  // Phase 3 — Electron-only FFmpeg audio bridge. The browser build will
+  // resolve `start()` to null and `stop()` to a no-op thanks to the
+  // `isElectron` gate inside the hook.
+  const processAudio = useProcessAudio();
+  /** True iff we are publishing system audio captured via FFmpeg (Electron). */
+  const [audioViaFfmpeg, setAudioViaFfmpeg] = useState(false);
 
   const streamRef = useRef<MediaStream | null>(null);
   const videoTrackRef = useRef<MediaStreamTrack | null>(null);
@@ -186,7 +204,16 @@ export function useScreenShare(
     }
     if (audioTrackRef.current) {
       audioTrackRef.current.stop();
+      // When audio came from the FFmpeg bridge we also have to ask the
+      // main process to tear down the subprocess + AudioContext.
+      if (audioViaFfmpeg) {
+        mesh.unpublishAudio();
+      }
       audioTrackRef.current = null;
+    }
+    if (audioViaFfmpeg) {
+      void processAudio.stop();
+      setAudioViaFfmpeg(false);
     }
     streamRef.current = null;
     presetRef.current = null;
@@ -194,7 +221,7 @@ export function useScreenShare(
     setIsStreaming(false);
     setStream(null);
     room.notifyStreamStop();
-  }, [mesh, room, cancelSource]);
+  }, [mesh, room, cancelSource, processAudio, audioViaFfmpeg]);
 
   /**
    * Shared post-capture pipeline for both Electron and browser paths:
@@ -278,6 +305,28 @@ export function useScreenShare(
           } as any)) as MediaStream;
 
           publishCapturedMedia(media, preset, presetId);
+
+          // Phase 3 — Electron: kick off FFmpeg-based system-audio capture.
+          // Failure is non-fatal: video still flows, peers just won't hear
+          // audio. Surface the error via the existing `error` channel.
+          void (async () => {
+            try {
+              const track = await processAudio.start();
+              if (track) {
+                audioTrackRef.current = track;
+                mesh.publishAudio(track);
+                setAudioViaFfmpeg(true);
+                setStream((s) => (s ? { ...s, hasAudio: true } : s));
+              } else if (processAudio.error) {
+                setError(`FFmpeg audio: ${processAudio.error}`);
+              }
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              console.error('[screen-share] processAudio.start failed:', msg);
+              setError(`FFmpeg audio: ${msg}`);
+            }
+          })();
+
           return;
         }
 
@@ -303,7 +352,7 @@ export function useScreenShare(
         }
       }
     },
-    [isElectron, mesh, room, configureVideoSenders, requestSourceFromPicker, publishCapturedMedia],
+    [isElectron, mesh, room, configureVideoSenders, requestSourceFromPicker, publishCapturedMedia, processAudio],
   );
 
   // Keep the ref pointing at the latest stopStream (so the track's 'ended'
@@ -361,6 +410,9 @@ export function useScreenShare(
     detachRemoteVideo,
     aecEnabled: false,
     setAecEnabled: () => {},
+    // Phase 3
+    isElectron,
+    audioViaFfmpeg,
     // Phase 2
     sourcePickerOpen,
     confirmSource,
