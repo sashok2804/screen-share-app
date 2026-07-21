@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { UseMeshResult } from './useMesh';
 import type { UseRoomResult } from './useRoom';
+import { useAec } from './useAec';
 import {
   getPreset,
   toDisplayMediaVideoConstraints,
@@ -33,6 +34,9 @@ export interface UseScreenShareResult {
   /** Attach a remote video track to the preview element. */
   attachRemoteVideo: (track: MediaStreamTrack) => void;
   detachRemoteVideo: (track: MediaStreamTrack) => void;
+  /** AEC toggle for the system-audio capture. */
+  aecEnabled: boolean;
+  setAecEnabled: (next: boolean) => void;
 }
 
 /**
@@ -46,10 +50,18 @@ export interface UseScreenShareResult {
 export function useScreenShare(
   mesh: UseMeshResult,
   room: UseRoomResult,
+  /**
+   * Reference stream used by the AEC graph to cancel the remote peer voices
+   * out of the captured system audio. Pass the same stream that the local
+   * <audio> playback element uses (i.e. what is leaking via the speakers).
+   */
+  getRemoteAudioStream: () => MediaStream | null,
 ): UseScreenShareResult {
   const [isStreaming, setIsStreaming] = useState(false);
   const [stream, setStream] = useState<ActiveStream | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const aec = useAec();
 
   const streamRef = useRef<MediaStream | null>(null);
   const videoTrackRef = useRef<MediaStreamTrack | null>(null);
@@ -108,13 +120,14 @@ export function useScreenShare(
       audioTrackRef.current.stop();
       audioTrackRef.current = null;
     }
+    aec.dispose();
     streamRef.current = null;
     presetRef.current = null;
     if (localPreviewRef.current) localPreviewRef.current.srcObject = null;
     setIsStreaming(false);
     setStream(null);
     room.notifyStreamStop();
-  }, [mesh, room]);
+  }, [mesh, room, aec]);
 
   const startStream = useCallback(
     async (presetId: QualityPresetId) => {
@@ -148,8 +161,13 @@ export function useScreenShare(
         // Audio (optional — Window sources won't have it).
         const audioTrack = media.getAudioTracks()[0];
         if (audioTrack) {
-          audioTrackRef.current = audioTrack;
-          mesh.publishAudio(audioTrack);
+          // Run through AEC if enabled and a reference stream is available.
+          // This is what prevents the remote peer from hearing themselves via
+          // our system loopback.
+          const reference = getRemoteAudioStream();
+          const publishedTrack = aec.process(audioTrack, reference) ?? audioTrack;
+          audioTrackRef.current = audioTrack; // keep raw track for cleanup
+          mesh.publishAudio(publishedTrack);
         }
 
         streamRef.current = media;
@@ -233,5 +251,7 @@ export function useScreenShare(
     changeQuality,
     attachRemoteVideo,
     detachRemoteVideo,
+    aecEnabled: aec.enabled,
+    setAecEnabled: aec.setEnabled,
   };
 }

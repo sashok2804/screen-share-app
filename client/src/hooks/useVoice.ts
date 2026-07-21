@@ -10,6 +10,11 @@ export interface UseVoiceResult {
   toggleMic: () => Promise<void>;
   /** Live audio element that plays incoming remote audio tracks. */
   remoteAudioRef: React.RefObject<HTMLAudioElement | null>;
+  /**
+   * The live MediaStream of incoming remote voices. Used as the AEC
+   * reference signal for system-audio capture cancellation.
+   */
+  getRemoteStream: () => MediaStream | null;
   /** Attach a remote audio track to the output element. */
   attachRemoteAudio: (track: MediaStreamTrack) => void;
   /** Detach a previously attached remote audio track. */
@@ -150,6 +155,7 @@ export function useVoice(mesh: UseMeshResult): UseVoiceResult {
     error,
     toggleMic,
     remoteAudioRef,
+    getRemoteStream: () => remoteStreamRef.current,
     attachRemoteAudio,
     detachRemoteAudio,
     localTrack,

@@ -8,6 +8,7 @@ coverage/
 
 # TypeScript incremental build artifacts (from tsc -b)
 *.tsbuildinfo
+**/*.tsbuildinfo
 vite.config.d.ts
 vite.config.js
 vitest.config.d.ts

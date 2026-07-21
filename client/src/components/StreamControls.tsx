@@ -10,6 +10,10 @@ export interface StreamControlsProps {
   /** Effective capture info, when streaming. */
   effective?: { width: number; height: number; frameRate: number; hasAudio: boolean } | null;
   errorMessage?: string | null;
+  /** AEC toggle state. */
+  aecEnabled?: boolean;
+  /** Toggle AEC. */
+  onToggleAec?: (next: boolean) => void;
 }
 
 export function StreamControls({
@@ -21,6 +25,8 @@ export function StreamControls({
   onStop,
   effective,
   errorMessage,
+  aecEnabled,
+  onToggleAec,
 }: StreamControlsProps) {
   if (!isHost) {
     return (
@@ -99,6 +105,23 @@ export function StreamControls({
               />
               <Stat label="Активный пресет" value={activePreset ?? '—'} />
             </div>
+          )}
+
+          {effective?.hasAudio && onToggleAec && (
+            <label className="flex items-center justify-between rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs cursor-pointer">
+              <div>
+                <div className="text-slate-200">Подавление эха (AEC)</div>
+                <div className="text-[10px] text-slate-500">
+                  Вычитает голоса других участников из системного звука
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={aecEnabled ?? true}
+                onChange={(e) => onToggleAec(e.target.checked)}
+                className="h-4 w-4 accent-indigo-500"
+              />
+            </label>
           )}
           {activePreset && (
             <div className="flex flex-wrap gap-1.5">

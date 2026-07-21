@@ -34,7 +34,7 @@ export function Room({ roomId, name, onLeave }: RoomProps) {
 
   const mesh = useMesh(signaling, () => room.selfId, callbacksRef);
   const voice = useVoice(mesh);
-  const screen = useScreenShare(mesh, room);
+  const screen = useScreenShare(mesh, room, voice.getRemoteStream);
 
   // Route remote tracks to the appropriate sinks.
   useEffect(() => {
@@ -218,6 +218,8 @@ export function Room({ roomId, name, onLeave }: RoomProps) {
                 : null
             }
             errorMessage={screen.error}
+            aecEnabled={screen.aecEnabled}
+            onToggleAec={screen.setAecEnabled}
           />
         </div>
 
