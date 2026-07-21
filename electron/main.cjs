@@ -9,12 +9,15 @@
  *   - Handle macOS `open-url` for portability (Windows-only build today, but be future-proof).
  *   - Set a strict CSP that still permits wss/https to the dev server and the public deployment.
  *
- * Phase 2/3 will add: desktopCapturer source picker, FFmpeg subprocess for WASAPI loopback capture.
+ * Phase 2 adds: desktopCapturer source picker IPC handlers (`desktop-capturer:getSources`
+ *               and `desktop-capturer:getSourceMetadata`) that back the renderer's custom
+ *               source-picker UI instead of the native getDisplayMedia dialog.
+ * Phase 3 will add: FFmpeg subprocess for WASAPI loopback capture.
  */
 
 'use strict';
 
-const { app, BrowserWindow, session, Menu, shell, ipcMain } = require('electron');
+const { app, BrowserWindow, session, Menu, shell, ipcMain, desktopCapturer } = require('electron');
 
 const path = require('path');
 
@@ -308,6 +311,72 @@ function registerProtocol() {
 ipcMain.on('electron:app-version-sync', (event) => {
   event.returnValue = app.getVersion();
 });
+
+// ---------------------------------------------------------------------------
+// Phase 2 — desktopCapturer source picker.
+// ---------------------------------------------------------------------------
+
+/**
+ * Cache of the most recent `getSources` result, keyed by source id. Used by
+ * `getSourceMetadata` so a follow-up name lookup (after the renderer picked a
+ * source) doesn't re-query the OS.
+ *
+ * @type {Map<string, { id: string, name: string, display_id?: string }>}
+ */
+const sourceCache = new Map();
+
+/**
+ * Renderer → main: list windows/screens with thumbnails + (optional) app icons.
+ * Returns plain-serialisable objects so they cross the contextBridge cleanly.
+ * Side effect: refreshes `sourceCache`.
+ */
+ipcMain.handle('desktop-capturer:getSources', async () => {
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['window', 'screen'],
+      thumbnailSize: { width: 320, height: 180 },
+      fetchWindowIcons: true,
+    });
+    /** @type {Array<{id: string, name: string, display_id?: string, thumbnailDataURL: string, appIconDataURL?: string | null}>} */
+    const result = sources.map((s) => {
+      const entry = {
+        id: s.id,
+        name: s.name,
+        display_id: s.display_id,
+        thumbnailDataURL: s.thumbnail.toDataURL(),
+        appIconDataURL: s.appIcon ? s.appIcon.toDataURL() : null,
+      };
+      sourceCache.set(s.id, { id: s.id, name: s.name, display_id: s.display_id });
+      return entry;
+    });
+    // Drop cache entries that are no longer present to avoid unbounded growth.
+    const liveIds = new Set(result.map((s) => s.id));
+    for (const id of [...sourceCache.keys()]) {
+      if (!liveIds.has(id)) sourceCache.delete(id);
+    }
+    return result;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[main] desktopCapturer.getSources failed:', err);
+    return [];
+  }
+});
+
+/**
+ * Renderer → main: cheap metadata lookup for a previously-listed source.
+ * Returns `{ name }` or `null` if the id is unknown / cache was cleared.
+ *
+ * @param {unknown} _event
+ * @param {unknown} sourceIdRaw
+ */
+ipcMain.handle(
+  'desktop-capturer:getSourceMetadata',
+  (_event, sourceIdRaw) => {
+    if (typeof sourceIdRaw !== 'string') return null;
+    const hit = sourceCache.get(sourceIdRaw);
+    return hit ? { name: hit.name } : null;
+  },
+);
 
 app.whenReady().then(async () => {
   installCsp();

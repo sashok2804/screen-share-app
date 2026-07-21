@@ -8,6 +8,7 @@ import {
   type QualityPresetId,
 } from '../lib/quality';
 import { applyBitrate, applyCodecPreferences } from '../lib/rtc';
+import type { ElectronSource } from '../electron';
 
 export interface ActiveStream {
   preset: QualityPreset;
@@ -36,6 +37,24 @@ export interface UseScreenShareResult {
   /** AEC toggle for the system-audio capture. */
   aecEnabled: boolean;
   setAecEnabled: (next: boolean) => void;
+
+  // ---- Phase 2: Electron source picker ---------------------------------
+  /**
+   * `true` while waiting for the user to pick a source in the custom
+   * SourcePicker modal (Electron only). The host component should render
+   * `<SourcePicker>` when this is true.
+   */
+  sourcePickerOpen: boolean;
+  /**
+   * Resolve the pending picker with the user's choice. Called by
+   * `<SourcePicker onPick>`.
+   */
+  confirmSource: (source: ElectronSource) => void;
+  /**
+   * Resolve the pending picker with a cancellation. Called by
+   * `<SourcePicker onCancel>`.
+   */
+  cancelSource: () => void;
 }
 
 /**
@@ -75,6 +94,49 @@ export function useScreenShare(
   /** Holds the latest stopStream so the 'ended' handler can call it safely. */
   const stopRef = useRef<() => void>(() => {});
 
+  // ---- Phase 2: Electron source picker -----------------------------------
+  //
+  // Design: `startStream` cannot render UI (it's a hook), so we lift the
+  // SourcePicker into Room.tsx. The picker's lifecycle is driven by a deferred
+  // promise stored in a ref: `startStream` opens the modal (sets the state),
+  // then awaits the promise. `<SourcePicker onPick>` calls `confirmSource`,
+  // which resolves the promise with the chosen source; `onCancel` (and
+  // `stopStream` as a safety net) call `cancelSource`, which rejects. This
+  // keeps the async flow inside `startStream` without leaking modal state into
+  // the call site.
+  const isElectron =
+    typeof window !== 'undefined' && window.electronAPI?.isElectron === true;
+  const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
+  /** Pending picker resolver: set when the modal opens, cleared on resolve. */
+  const pendingSourceRef = useRef<{
+    resolve: (s: ElectronSource) => void;
+    reject: (err: Error) => void;
+  } | null>(null);
+
+  /** Open the picker and resolve with the user's chosen source, or reject on cancel. */
+  const requestSourceFromPicker = useCallback((): Promise<ElectronSource> => {
+    return new Promise<ElectronSource>((resolve, reject) => {
+      pendingSourceRef.current = { resolve, reject };
+      setSourcePickerOpen(true);
+    });
+  }, []);
+
+  const confirmSource = useCallback((source: ElectronSource) => {
+    const pending = pendingSourceRef.current;
+    if (!pending) return;
+    pendingSourceRef.current = null;
+    setSourcePickerOpen(false);
+    pending.resolve(source);
+  }, []);
+
+  const cancelSource = useCallback(() => {
+    const pending = pendingSourceRef.current;
+    if (!pending) return;
+    pendingSourceRef.current = null;
+    setSourcePickerOpen(false);
+    pending.reject(new Error('Выбор источника отменён'));
+  }, []);
+
   useEffect(() => {
     if (localPreviewRef.current) {
       localPreviewRef.current.srcObject = streamRef.current;
@@ -112,6 +174,11 @@ export function useScreenShare(
   );
 
   const stopStream = useCallback(() => {
+    // Safety net: if the user clicks stop while the picker is open, cancel
+    // the pending promise so startStream() doesn't hang waiting on a resolver.
+    if (pendingSourceRef.current) {
+      cancelSource();
+    }
     if (videoTrackRef.current) {
       videoTrackRef.current.stop();
       mesh.unpublishVideo();
@@ -127,7 +194,53 @@ export function useScreenShare(
     setIsStreaming(false);
     setStream(null);
     room.notifyStreamStop();
-  }, [mesh, room]);
+  }, [mesh, room, cancelSource]);
+
+  /**
+   * Shared post-capture pipeline for both Electron and browser paths:
+   * publish the video track, configure codec/bitrate, attach preview,
+   * wire the 'ended' handler, and surface the ActiveStream + room notify.
+   */
+  const publishCapturedMedia = useCallback(
+    (media: MediaStream, preset: QualityPreset, presetId: QualityPresetId) => {
+      const videoTrack = media.getVideoTracks()[0];
+      if (!videoTrack) throw new Error('No video track captured');
+
+      // Publish first (creates the transceiver/sender), then configure it.
+      mesh.publishVideo(videoTrack);
+      videoTrackRef.current = videoTrack;
+      presetRef.current = preset;
+      configureVideoSenders(videoTrack, preset);
+
+      // Audio (optional — Window sources won't have it; Electron path captures
+      // audio separately via the Phase 3 FFmpeg/WASAPI bridge).
+      const audioTrack = media.getAudioTracks()[0];
+      if (audioTrack) {
+        audioTrackRef.current = audioTrack;
+        mesh.publishAudio(audioTrack);
+      }
+
+      streamRef.current = media;
+      if (localPreviewRef.current) localPreviewRef.current.srcObject = media;
+
+      // Listen for the user pressing "Stop sharing" (browser bar) or the
+      // Electron share-helpers stopping the desktop track.
+      videoTrack.addEventListener('ended', () => stopRef.current());
+
+      const settings = videoTrack.getSettings();
+      setStream({
+        preset,
+        width: settings.width ?? preset.width,
+        height: settings.height ?? preset.height,
+        frameRate: settings.frameRate ?? preset.frameRate,
+        hasAudio: !!audioTrack,
+      });
+      setIsStreaming(true);
+      setError(null);
+      room.notifyStreamStart(presetId);
+    },
+    [mesh, room, configureVideoSenders],
+  );
 
   const startStream = useCallback(
     async (presetId: QualityPresetId) => {
@@ -137,6 +250,38 @@ export function useScreenShare(
         }
         const preset = getPreset(presetId);
 
+        // ----- Electron: custom source picker → chromeMediaSource: 'desktop' -----
+        if (isElectron) {
+          let source: ElectronSource;
+          try {
+            source = await requestSourceFromPicker();
+          } catch {
+            // User dismissed the picker — treat as a silent cancel, not an error.
+            return;
+          }
+          // Electron's desktop-capture constraint shape is non-standard; the
+          // `mandatory` wrapper is required by Chromium's desktop capturer.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const media = (await navigator.mediaDevices.getUserMedia({
+            audio: false, // Phase 3 will add process audio via the FFmpeg bridge.
+            video: {
+              mandatory: {
+                chromeMediaSource: 'desktop',
+                chromeMediaSourceId: source.id,
+                maxWidth: preset.width,
+                maxHeight: preset.height,
+                maxFrameRate: preset.frameRate,
+                minFrameRate: preset.frameRate,
+              },
+            },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any)) as MediaStream;
+
+          publishCapturedMedia(media, preset, presetId);
+          return;
+        }
+
+        // ----- Browser: native getDisplayMedia (unchanged from Phase 1) ---------
         const media = await navigator.mediaDevices.getDisplayMedia({
           video: toDisplayMediaVideoConstraints(preset),
           audio: {
@@ -149,44 +294,7 @@ export function useScreenShare(
           },
         });
 
-        const videoTrack = media.getVideoTracks()[0];
-        if (!videoTrack) throw new Error('No video track captured');
-
-        // Publish first (creates the transceiver/sender), then configure it.
-        mesh.publishVideo(videoTrack);
-        videoTrackRef.current = videoTrack;
-        presetRef.current = preset;
-        configureVideoSenders(videoTrack, preset);
-
-        // Audio (optional — Window sources won't have it).
-        // NOTE: AEC is disabled by default. Browser-side AEC cannot reliably
-        // remove the remote peer's voice from a system-audio loopback, and
-        // enabling it caused demo audio to be dropped entirely. The proper
-        // fix is process-loopback capture (WASAPI), available in the Electron
-        // desktop client — see electron/ directory.
-        const audioTrack = media.getAudioTracks()[0];
-        if (audioTrack) {
-          audioTrackRef.current = audioTrack;
-          mesh.publishAudio(audioTrack);
-        }
-
-        streamRef.current = media;
-        if (localPreviewRef.current) localPreviewRef.current.srcObject = media;
-
-        // Listen for the user pressing "Stop sharing" in the Chrome bar.
-        videoTrack.addEventListener('ended', () => stopRef.current());
-
-        const settings = videoTrack.getSettings();
-        setStream({
-          preset,
-          width: settings.width ?? preset.width,
-          height: settings.height ?? preset.height,
-          frameRate: settings.frameRate ?? preset.frameRate,
-          hasAudio: !!audioTrack,
-        });
-        setIsStreaming(true);
-        setError(null);
-        room.notifyStreamStart(presetId);
+        publishCapturedMedia(media, preset, presetId);
       } catch (err) {
         if (err instanceof DOMException && err.name === 'NotAllowedError') {
           setError('Доступ к экрану отменён');
@@ -195,7 +303,7 @@ export function useScreenShare(
         }
       }
     },
-    [mesh, room, configureVideoSenders],
+    [isElectron, mesh, room, configureVideoSenders, requestSourceFromPicker, publishCapturedMedia],
   );
 
   // Keep the ref pointing at the latest stopStream (so the track's 'ended'
@@ -253,5 +361,9 @@ export function useScreenShare(
     detachRemoteVideo,
     aecEnabled: false,
     setAecEnabled: () => {},
+    // Phase 2
+    sourcePickerOpen,
+    confirmSource,
+    cancelSource,
   };
 }

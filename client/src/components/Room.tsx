@@ -9,6 +9,7 @@ import { VideoStage } from './VideoStage';
 import { ParticipantList } from './ParticipantList';
 import { StreamControls } from './StreamControls';
 import { SubscribeButton } from './SubscribeButton';
+import { SourcePicker } from './SourcePicker';
 
 export interface RoomProps {
   roomId: string;
@@ -251,6 +252,14 @@ export function Room({ roomId, name, onLeave }: RoomProps) {
 
       {/* Hidden audio sink for remote voice. */}
       <audio ref={voice.remoteAudioRef} autoPlay className="hidden" />
+
+      {/* Electron-only custom source picker (replaces native getDisplayMedia dialog). */}
+      {screen.sourcePickerOpen && (
+        <SourcePicker
+          onPick={(s) => screen.confirmSource(s)}
+          onCancel={() => screen.cancelSource()}
+        />
+      )}
 
       {signaling.lastError && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-2 text-sm text-rose-300">
