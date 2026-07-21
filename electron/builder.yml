@@ -15,8 +15,12 @@ files:
   - '!dist/**'
   - '!out/**'
 
-# FFmpeg binary + WASAPI helper will be bundled here in later phases.
-extraResources: []
+# FFmpeg binary bundled into resources/ffmpeg.exe at install time.
+# `electron/scripts/download-ffmpeg.cjs` populates bin/ffmpeg.exe — run
+# `npm -w electron run download-ffmpeg` before `npm -w electron run build`.
+extraResources:
+  - from: bin/ffmpeg.exe
+    to: ffmpeg.exe
 
 win:
   target:
@@ -31,6 +35,10 @@ nsis:
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: Screen Share
+  # We don't use electron-updater's differential download, and generating the
+  # blockmap pulls in `@noble/hashes/blake2.js` which is broken on Node 22.11
+  # (app-builder-lib uses an ESM-incompatible require path). Disable it.
+  differentialPackage: false
 
 protocols:
   - name: Screen Share URL

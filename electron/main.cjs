@@ -31,9 +31,20 @@ const { FFmpegAudioCapture } = require('./src/ffmpeg-bridge.cjs');
  * the Fastify HTTPS server on :3000. Override with SCREENSHARE_URL env var.
  */
 const DEFAULT_URL = 'https://localhost:3000';
-const RESOLVED_URL = process.env.SCREENSARE_URL || DEFAULT_URL;
+const RESOLVED_URL = process.env.SCREENSHARE_URL || DEFAULT_URL;
 
-const isDev = process.env.NODE_ENV !== 'production';
+/**
+ * In dev we use a self-signed cert (server/certs/cert.pem). Chromium blocks the
+ * load with ERR_CERT_AUTHORITY_INVALID and surfaces an interstitial that makes
+ * the picker/audio loop painful to test. When NOT packaged we install a
+ * `setCertificateVerifyProc` that accepts any cert whose host is localhost (or
+ * 127.0.0.1) so the dev server loads cleanly.
+ *
+ * PRODUCTION BUILDS MUST USE A PROPERLY TRUSTED CERTIFICATE. We never bypass
+ * cert verification when `app.isPackaged` is true — the verify proc is simply
+ * not installed, so Chromium's default validation applies.
+ */
+const isDev = !app.isPackaged && process.env.NODE_ENV !== 'production';
 
 /** @type {BrowserWindow | null} */
 let mainWindow = null;
@@ -407,7 +418,7 @@ function getFFmpegPath() {
   let resolved = null;
 
   // (1) Env var override.
-  const envPath = process.env.SCREENSARE_FFMPEG || process.env.SCREENSHARE_FFMPEG;
+  const envPath = process.env.SCREENSHARE_FFMPEG;
   if (envPath && fs.existsSync(envPath)) {
     resolved = path.resolve(envPath);
   }
@@ -586,9 +597,42 @@ ipcMain.handle('audio:stop', async () => {
   }
 });
 
+/**
+ * Dev-only certificate bypass. When the app is NOT packaged we accept any
+ * certificate served from `localhost` or `127.0.0.1` so that the self-signed
+ * HTTPS dev server (`https://localhost:3000`) loads without the Chromium
+ * interstitial. Packaged builds never install this hook, so they fall back to
+ * Chromium's default verification — production deployments must use a cert
+ * trusted by the user's OS (e.g. via mkcert + installed root CA, or a real CA).
+ */
+function installDevCertBypass() {
+  if (app.isPackaged) {
+    // Never bypass cert verification in production.
+    return;
+  }
+  session.defaultSession.setCertificateVerifyProc((request, callback) => {
+    const { hostname } = request;
+    if (
+      typeof hostname === 'string' &&
+      (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1')
+    ) {
+      // 0 === verification success in Chromium's CertVerifyResult enum.
+      callback(0);
+      return;
+    }
+    // For any other host, defer to Chromium's default validation.
+    callback(-1);
+  });
+  // eslint-disable-next-line no-console
+  console.log(
+    '[main] dev cert bypass active for localhost/127.0.0.1 — packaged builds must use a trusted cert',
+  );
+}
+
 // Pre-resolve ffmpeg path so we log the discovery (or warning) once at startup.
 app.whenReady().then(async () => {
   installCsp();
+  installDevCertBypass();
   registerProtocol();
   Menu.setApplicationMenu(buildMenu());
   getFFmpegPath(); // logs resolved path / warning

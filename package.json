@@ -17,7 +17,8 @@
     "start": "npm -w server start",
     "test": "npm -w server test && npm -w client test",
     "test:watch": "concurrently -n server,client -c blue,magenta \"npm -w server run test:watch\" \"npm -w client run test:watch\"",
-    "test:coverage": "npm -w server run test:coverage && npm -w client run test:coverage"
+    "test:coverage": "npm -w server run test:coverage && npm -w client run test:coverage",
+    "postinstall": "node electron/scripts/patch-app-builder.cjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.0"

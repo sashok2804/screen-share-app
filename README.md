@@ -4,6 +4,12 @@
 **1440p · 60 fps**. Сигналинг через Node.js/Fastify/ws, медиа — напрямую между
 браузерами через WebRTC.
 
+> **Хостам на Windows**: используйте десктоп-клиент (см.
+> [Desktop client](#desktop-client-windows-recommended-for-hosts) ниже) — он
+> захватывает системный звук через WASAPI без эха. Веб-сборка на Chrome при
+> включённом «share audio» создаёт петлю: удалённый зритель слышит сам себя
+> через ваши колонки → loopback → обратно. AEC браузера для loopback не работает.
+
 ## Возможности
 
 - Комнаты без авторизации: вводишь `roomId` + имя → зашёл.
@@ -94,12 +100,65 @@ https://ВАШ_ПУБЛИЧНЫЙ_IP:3000/?room=имя-комнаты
 
 ## Production-сборка
 
+По умолчанию слушает `0.0.0.0:3000`. Переопределить:
+
 ```bash
-npm run build      # собирает client/dist и server/dist
-npm start          # поднимает Fastify, раздаёт статику и WS на одном порту
+PORT=8080 HOST=0.0.0.0 node server/dist/index.js
 ```
 
-По умолчанию слушает `0.0.0.0:3000`. Переопределить:
+## Desktop client (Windows, recommended for hosts)
+
+For best audio quality (no echo when sharing screen with audio), use the
+Electron desktop client instead of the web browser.
+
+The web build's audio limitation: Chrome's `getDisplayMedia({audio:true})` on
+"Entire screen" creates a feedback loop — the remote peer hears themselves
+through the host's speakers → loopback → back to them. Browser-side AEC doesn't
+fix this for loopback capture. The desktop client captures system audio out of
+process via FFmpeg (WASAPI loopback), so the host's mic path is isolated from
+the system-audio path — no echo.
+
+### Build the installer
+
+```bash
+npm install                                    # at repo root
+npm -w electron run download-ffmpeg           # fetches ffmpeg.exe (~80 MB)
+npm -w electron run build                     # produces electron/dist/*.exe
+```
+
+The resulting `Screen Share Setup X.X.X.exe` bundles:
+- The Electron runtime
+- The React client (loaded from https://YOUR_SERVER:3000)
+- FFmpeg for WASAPI loopback audio capture
+- Custom URL protocol `screen-share://`
+
+Requirements:
+- Windows 10+ x64.
+- Node 22.12+ recommended. Node 22.11 works too — the
+  `postinstall` script (`electron/scripts/patch-app-builder.cjs`) stubs an
+  ESM-only require inside `app-builder-lib` so `electron-builder` runs.
+- The HTTPS server must be reachable at the URL the app loads
+  (`https://localhost:3000` by default; override via `SCREENSHARE_URL`).
+  Production deployments must use a certificate trusted by the user's OS —
+  the dev self-signed bypass only runs when `!app.isPackaged`.
+
+### Custom URL protocol
+
+After installation the app registers the `screen-share://` scheme on first
+launch (via `app.setAsDefaultProtocolClient`). Links like
+`screen-share://room/my-room` open the app directly in the specified room.
+
+How to verify after install:
+
+1. Launch the app once (this writes the Windows registry mapping).
+2. Open `screen-share://room/test123` in any browser.
+3. Windows prompts to open with "Screen Share" → accept.
+4. The app focuses and navigates to `?room=test123` on the server URL.
+
+Note: `electron-builder`'s `build.protocols` block is **macOS-only** (writes
+`Info.plist` entries). On Windows the scheme is registered at runtime — the
+NSIS installer itself does not write the registry key. This matches how
+Discord/Slack/VS Code handle Windows deep-link registration.
 
 ```bash
 PORT=8080 HOST=0.0.0.0 node server/dist/index.js
@@ -219,8 +278,9 @@ UI как effective resolution.
 
 ```
 screen-share-app/
-├── package.json              # npm workspaces
+├── package.json              # npm workspaces + postinstall (patches app-builder-lib)
 ├── README.md
+├── CONTEXT.md                # project context (audio loopback problem, Electron plan)
 ├── server/
 │   ├── package.json
 │   ├── tsconfig.json
@@ -235,22 +295,36 @@ screen-share-app/
 │       ├── rooms.test.ts     # 27 tests
 │       ├── signaling.test.ts # 18 tests
 │       └── e2e.smoke.ts      # 2 tests (real server)
-└── client/
-    ├── package.json
-    ├── vite.config.ts
-    ├── vitest.config.ts
-    ├── index.html
-    ├── src/
-    │   ├── main.tsx
-    │   ├── App.tsx
-    │   ├── components/{Lobby,Room,VideoStage,ParticipantList,StreamControls,SubscribeButton}.tsx
-    │   ├── hooks/{useSignaling,useRoom,useMesh,useVoice,useScreenShare}.ts
-    │   ├── lib/{quality,rtc}.ts
-    │   └── styles/index.css
-    └── test/
-        ├── quality.test.ts   # 10 tests
-        ├── rtc.test.ts       # 10 tests
-        └── setup.ts
+├── client/
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── vitest.config.ts
+│   ├── index.html
+│   ├── src/
+│   │   ├── main.tsx
+│   │   ├── App.tsx
+│   │   ├── components/{Lobby,Room,VideoStage,ParticipantList,StreamControls,SourcePicker,AudioMeter}.tsx
+│   │   ├── hooks/{useSignaling,useRoom,useMesh,useVoice,useScreenShare,useProcessAudio,useAudioLevel}.ts
+│   │   ├── workers/process-audio-worklet.js   # PCM → AudioWorklet ring
+│   │   ├── lib/{quality,rtc}.ts
+│   │   └── styles/index.css
+│   └── test/
+│       ├── quality.test.ts   # 10 tests
+│       ├── rtc.test.ts       # 10 tests
+│       └── setup.ts
+└── electron/                 # Windows desktop client (Phase 4)
+    ├── package.json          # build config (NSIS), download-ffmpeg script
+    ├── builder.yml           # human-readable mirror of package.json `build`
+    ├── main.cjs              # Electron main + IPC + FFmpeg/WASAPI bridge
+    ├── preload.cjs           # contextBridge → window.electronAPI
+    ├── bin/                  # downloaded ffmpeg.exe (gitignored, ~97 MB)
+    ├── build/icon.ico        # placeholder 16..256 icon
+    ├── scripts/
+    │   ├── download-ffmpeg.cjs     # fetch + extract ffmpeg from gyan.dev
+    │   └── patch-app-builder.cjs   # postinstall: fixes app-builder-lib ESM bug
+    └── src/
+        ├── ffmpeg-bridge.cjs       # FFmpegAudioCapture class (f32le PCM stream)
+        └── dshow-devices.cjs       # list DirectShow audio devices
 ```
 
 ## Что дальше (Фаза 2)
@@ -258,7 +332,10 @@ screen-share-app/
 - **SFU-режим** через mediasoup: для 10+ зрителей. Переключатель mesh/SFU в UI.
 - **Запись стрима** (VOD): MediaRecorder → chunked upload → каталог прошлых
   записей.
-- **Электрон-клиент хоста**: для звука отдельного окна приложения (process
-  loopback).
+- ~~**Электрон-клиент хоста**: для звука отдельного окна приложения (process
+  loopback).~~ ✅ Done — см. [Desktop client](#desktop-client-windows-recommended-for-hosts).
 - **SVC** (VP9/AV1 слои): сервер раздаёт разным зрителям разные слои качества по
   их каналу.
+- **Code signing**: NSIS installer сейчас подписан self-signed/test cert.
+  Для распространения нужен Authenticode cert (EV или OV) — иначе SmartScreen
+  будет ругаться.
