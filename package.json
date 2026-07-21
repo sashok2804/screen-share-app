@@ -5,12 +5,14 @@
   "description": "P2P WebRTC screen-sharing rooms with 1440p@60fps demo streaming",
   "workspaces": [
     "server",
-    "client"
+    "client",
+    "electron"
   ],
   "scripts": {
     "dev": "concurrently -n server,client -c blue,magenta \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "npm -w server run dev",
     "dev:client": "npm -w client run dev",
+    "dev:electron": "npm -w electron run dev",
     "build": "npm -w server run build && npm -w client run build",
     "start": "npm -w server start",
     "test": "npm -w server test && npm -w client test",

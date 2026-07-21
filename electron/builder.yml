@@ -1,0 +1,39 @@
+# electron-builder configuration mirrored from package.json "build".
+# Kept in sync; either source is authoritative — package.json takes precedence
+# when both are present, so this file is mainly for human-readable reference.
+
+appId: com.sashok2804.screenshare
+productName: Screen Share
+
+directories:
+  output: dist
+  buildResources: build
+
+files:
+  - '**/*'
+  - '!**/*.map'
+  - '!dist/**'
+  - '!out/**'
+
+# FFmpeg binary + WASAPI helper will be bundled here in later phases.
+extraResources: []
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Screen Share
+
+protocols:
+  - name: Screen Share URL
+    schemes:
+      - screen-share
+    role: Viewer

@@ -16,3 +16,8 @@ vitest.config.js
 
 # TLS certs (generated locally, never commit)
 server/certs/*.pem
+
+# Electron desktop client (Phase 1+)
+electron/node_modules/
+electron/dist/
+electron/out/

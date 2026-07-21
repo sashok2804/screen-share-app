@@ -1,0 +1,62 @@
+{
+  "name": "@screenshare/electron",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron desktop client for the screen-share-app (Windows). Loads the React client over HTTPS and adds process-loopback audio capture via FFmpeg.",
+  "type": "commonjs",
+  "main": "main.cjs",
+  "scripts": {
+    "dev": "electron .",
+    "build": "electron-builder --win nsis",
+    "clean": "rimraf dist out"
+  },
+  "dependencies": {
+    "electron": "^33.0.0"
+  },
+  "devDependencies": {
+    "electron-builder": "^26.0.0",
+    "rimraf": "^5.0.0"
+  },
+  "build": {
+    "appId": "com.sashok2804.screenshare",
+    "productName": "Screen Share",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "**/*",
+      "!**/*.map",
+      "!dist/**",
+      "!out/**"
+    ],
+    "extraResources": [],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Screen Share"
+    },
+    "protocols": [
+      {
+        "name": "Screen Share URL",
+        "schemes": [
+          "screen-share"
+        ],
+        "role": "Viewer"
+      }
+    ]
+  }
+}
