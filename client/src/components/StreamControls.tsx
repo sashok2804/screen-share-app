@@ -26,7 +26,6 @@ export function StreamControls({
   effective,
   errorMessage,
   aecEnabled,
-  onToggleAec,
 }: StreamControlsProps) {
   if (!isHost) {
     return (
@@ -107,21 +106,14 @@ export function StreamControls({
             </div>
           )}
 
-          {effective?.hasAudio && onToggleAec && (
-            <label className="flex items-center justify-between rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs cursor-pointer">
-              <div>
-                <div className="text-slate-200">Подавление эха (AEC)</div>
-                <div className="text-[10px] text-slate-500">
-                  Вычитает голоса других участников из системного звука
-                </div>
+          {effective?.hasAudio && aecEnabled !== undefined && (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-300/90">
+              <div className="font-medium">Звук захвачен с системным loopback</div>
+              <div className="mt-0.5 text-[10px] text-amber-300/70">
+                Друг может слышать эхо своего голоса. Для чистого звука без эха —
+                используй desktop-клиент (Electron) с WASAPI loopback.
               </div>
-              <input
-                type="checkbox"
-                checked={aecEnabled ?? true}
-                onChange={(e) => onToggleAec(e.target.checked)}
-                className="h-4 w-4 accent-indigo-500"
-              />
-            </label>
+            </div>
           )}
           {activePreset && (
             <div className="flex flex-wrap gap-1.5">

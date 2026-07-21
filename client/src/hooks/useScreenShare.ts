@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { UseMeshResult } from './useMesh';
 import type { UseRoomResult } from './useRoom';
-import { useAec } from './useAec';
 import {
   getPreset,
   toDisplayMediaVideoConstraints,
@@ -61,7 +60,9 @@ export function useScreenShare(
   const [stream, setStream] = useState<ActiveStream | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const aec = useAec();
+  // Reserved for the Electron desktop client, where a real process-loopback
+  // capture will replace the system-audio path. Unused in the web build.
+  void getRemoteAudioStream;
 
   const streamRef = useRef<MediaStream | null>(null);
   const videoTrackRef = useRef<MediaStreamTrack | null>(null);
@@ -120,14 +121,13 @@ export function useScreenShare(
       audioTrackRef.current.stop();
       audioTrackRef.current = null;
     }
-    aec.dispose();
     streamRef.current = null;
     presetRef.current = null;
     if (localPreviewRef.current) localPreviewRef.current.srcObject = null;
     setIsStreaming(false);
     setStream(null);
     room.notifyStreamStop();
-  }, [mesh, room, aec]);
+  }, [mesh, room]);
 
   const startStream = useCallback(
     async (presetId: QualityPresetId) => {
@@ -159,23 +159,15 @@ export function useScreenShare(
         configureVideoSenders(videoTrack, preset);
 
         // Audio (optional — Window sources won't have it).
+        // NOTE: AEC is disabled by default. Browser-side AEC cannot reliably
+        // remove the remote peer's voice from a system-audio loopback, and
+        // enabling it caused demo audio to be dropped entirely. The proper
+        // fix is process-loopback capture (WASAPI), available in the Electron
+        // desktop client — see electron/ directory.
         const audioTrack = media.getAudioTracks()[0];
         if (audioTrack) {
-          // Run through AEC if enabled and a reference stream is available.
-          // This is what prevents the remote peer from hearing themselves via
-          // our system loopback.
-          const reference = getRemoteAudioStream();
-          console.debug('[screen-share] audio track captured', {
-            hasReference: !!reference,
-            referenceTracks: reference?.getAudioTracks().length ?? 0,
-            aecEnabled: aec.enabled,
-          });
-          const publishedTrack = (await aec.process(audioTrack, reference)) ?? audioTrack;
-          console.debug('[screen-share] using track', {
-            processed: publishedTrack !== audioTrack,
-          });
-          audioTrackRef.current = audioTrack; // keep raw track for cleanup
-          mesh.publishAudio(publishedTrack);
+          audioTrackRef.current = audioTrack;
+          mesh.publishAudio(audioTrack);
         }
 
         streamRef.current = media;
@@ -259,7 +251,7 @@ export function useScreenShare(
     changeQuality,
     attachRemoteVideo,
     detachRemoteVideo,
-    aecEnabled: aec.enabled,
-    setAecEnabled: aec.setEnabled,
+    aecEnabled: false,
+    setAecEnabled: () => {},
   };
 }
