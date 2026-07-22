@@ -1011,6 +1011,82 @@ ipcMain.handle('audio:listProcesses', async () => {
 });
 
 /**
+ * Resolve the on-disk path of the `get-pid.ps1` helper. In development the
+ * script lives at `<electron>/scripts/get-pid.ps1` (next to this file). In a
+ * packaged build it ships as an `extraResource` at the resources root, so we
+ * switch to `process.resourcesPath` when `app.isPackaged` is true. PowerShell
+ * can't reliably read inside `app.asar`, which is why the script is unpacked.
+ *
+ * @returns {string}
+ */
+function getPidScriptPath() {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'get-pid.ps1');
+  }
+  return path.join(__dirname, 'scripts', 'get-pid.ps1');
+}
+
+/**
+ * IPC: authoritatively resolve the PID behind a desktopCapturer window source
+ * by parsing the Win32 HWND out of the source.id and calling
+ * user32!GetWindowThreadProcessId via PowerShell P/Invoke.
+ *
+ * Why this exists: Electron's desktopCapturer does NOT expose the PID behind a
+ * window source. The previous name-matching heuristic
+ * (`findProcessBySourceName` in `useScreenShare`) is brittle — `source.name`
+ * is usually the window title, which often differs from PowerShell's
+ * `MainWindowTitle` (e.g. "Chrome — YouTube" vs "YouTube - Google Chrome"),
+ * causing a silent fallback to whole-system loopback → echo of the remote
+ * peer's voice. The source.id format `"window:<HWND>:<something>"` carries
+ * the actual Win32 window handle, and `GetWindowThreadProcessId` gives us the
+ * owning PID deterministically — no name guessing.
+ *
+ * Resolves to a positive number on success, `null` when:
+ *   - platform is not win32,
+ *   - sourceId is missing / malformed (no `window:<n>:` prefix),
+ *   - HWND is 0 / invalid (the .ps1 returns 0),
+ *   - PowerShell fails to spawn or times out.
+ *
+ * @param {unknown} _event
+ * @param {unknown} sourceIdRaw  desktopCapturer source.id (`"window:<HWND>:..."`).
+ * @returns {Promise<number | null>}
+ */
+ipcMain.handle('audio:getPidFromSourceId', async (_event, sourceIdRaw) => {
+  if (process.platform !== 'win32') return null;
+
+  // Parse HWND from source.id format "window:<HWND>:<something>".
+  const match =
+    typeof sourceIdRaw === 'string' && sourceIdRaw.match(/^window:(\d+):/);
+  if (!match) return null;
+  const hwnd = parseInt(match[1], 10);
+  if (!hwnd || !Number.isFinite(hwnd)) return null;
+
+  try {
+    const scriptPath = getPidScriptPath();
+    // -ExecutionPolicy Bypass is required because we ship the script as an
+    // extraResource outside the app's signed context.
+    const result = execSync(
+      `powershell -NoProfile -ExecutionPolicy Bypass -File "${scriptPath}" -Hwnd ${hwnd}`,
+      { encoding: 'utf8', windowsHide: true, timeout: 5000 },
+    ).trim();
+    const pid = parseInt(result, 10);
+    if (Number.isFinite(pid) && pid > 0) return pid;
+    // pid === 0 means GetWindowThreadProcessId didn't recognise the HWND —
+    // treat as "could not resolve" so the caller falls back to the heuristic.
+    return null;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(
+      '[audio:getPidFromSourceId] failed for hwnd',
+      hwnd,
+      ':',
+      err && err.message ? err.message : err,
+    );
+    return null;
+  }
+});
+
+/**
  * IPC: start WASAPI loopback capture. `opts` is one of:
  *   - `{ system: true }`         capture the entire default render endpoint
  *                                 (classic WASAPI loopback — everything playing).

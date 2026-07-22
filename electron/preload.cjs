@@ -104,6 +104,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   /**
+   * Authoritatively resolve the owning PID of a desktopCapturer window source
+   * by parsing the Win32 HWND out of `source.id` (`"window:<HWND>:..."`) and
+   * calling `user32!GetWindowThreadProcessId` via PowerShell P/Invoke. This is
+   * the deterministic replacement for the name-matching heuristic — used first,
+   * with `listAudioProcesses` kept as a fallback.
+   *
+   * @param {string} sourceId  desktopCapturer source.id (`"window:<HWND>:..."`).
+   * @returns {Promise<number | null>} PID on success, `null` when the HWND
+   *   can't be resolved (non-Windows, malformed id, invalid HWND, PowerShell
+   *   failure). The caller falls back to the name heuristic.
+   */
+  getPidFromSourceId: async (sourceId) => {
+    if (typeof sourceId !== 'string' || sourceId.length === 0) return null;
+    const result = await ipcRenderer.invoke('audio:getPidFromSourceId', sourceId);
+    return typeof result === 'number' && result > 0 ? result : null;
+  },
+
+  /**
    * Returns the Electron main process's own PID (`process.processId`). The
    * renderer uses this for the "entire screen" audio path: passing our own PID
    * as `excludePid` to `startProcessAudio` captures the whole desktop minus

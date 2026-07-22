@@ -34,7 +34,12 @@
       "!bin/**",
       "!scripts/**"
     ],
-    "extraResources": [],
+    "extraResources": [
+      {
+        "from": "scripts/get-pid.ps1",
+        "to": "get-pid.ps1"
+      }
+    ],
     "asarUnpack": [
       "**/node_modules/loopback-capture/**"
     ],

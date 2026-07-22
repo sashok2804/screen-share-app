@@ -90,8 +90,15 @@ export function findProcessBySourceName(
  *
  *   - screen source (source.id starts with "screen:") → EXCLUDE our own PID.
  *     Captures the whole desktop minus our renderer's audio → no echo.
- *   - window source → resolve PID via `listAudioProcesses` + heuristic; if
- *     found, INCLUDE that PID's tree; otherwise fall back to system audio.
+ *   - window source → resolve PID via TWO strategies:
+ *       (1) AUTHORITATIVE — parse the Win32 HWND out of `source.id`
+ *           (`"window:<HWND>:..."`) and call `user32!GetWindowThreadProcessId`
+ *           via `getPidFromSourceId`. Deterministic, no name guessing.
+ *       (2) HEURISTIC — match `source.name` against `listAudioProcesses`
+ *           (`findProcessBySourceName`). Kept as a fallback for older preloads
+ *           that don't expose `getPidFromSourceId`.
+ *     If a PID is resolved, INCLUDE that process's tree; otherwise fall back
+ *     to whole-system loopback (which may cause echo — UI warns the host).
  *
  * @param source The video source the host picked in `<SourcePicker>`.
  * @returns The `StartProcessAudioOptions` to pass to `processAudio.start`.
@@ -117,7 +124,19 @@ async function resolveAudioSelection(source: ElectronSource): Promise<StartProce
     return { system: true };
   }
 
-  // Window → try to resolve the PID.
+  // Window source → resolve PID. Try the authoritative HWND path first.
+  if (api?.getPidFromSourceId) {
+    try {
+      const pid = await api.getPidFromSourceId(source.id);
+      if (typeof pid === 'number' && pid > 0) {
+        return { pid, includeTree: true };
+      }
+    } catch (err) {
+      console.warn('[screen-share] getPidFromSourceId failed, trying name heuristic', err);
+    }
+  }
+
+  // Heuristic fallback — match by name against the running process list.
   if (api?.listAudioProcesses) {
     try {
       const processes = await api.listAudioProcesses();
@@ -131,6 +150,7 @@ async function resolveAudioSelection(source: ElectronSource): Promise<StartProce
   }
 
   // Fallback: whole default render endpoint (classic WASAPI loopback).
+  // May cause echo — the UI labels this so the host knows.
   return { system: true };
 }
 
@@ -153,6 +173,11 @@ function describeAudioSelection(
     // "YouTube — Google Chrome"). Truncate so the chip stays compact.
     const name = (source.name ?? '').trim();
     return name.length > 32 ? `${name.slice(0, 31)}…` : name || 'Выбранное приложение';
+  }
+  // system:true fallback for a window pick — the remote peer may hear
+  // themselves. Label warns the host instead of looking like a clean capture.
+  if (source.id.startsWith('window:')) {
+    return 'Системный звук (PID не найден — возможно эхо)';
   }
   return 'Системный звук';
 }
@@ -277,12 +302,15 @@ export function useScreenShare(
    * caller isn't awaiting. The video stream is NOT reverted if audio fails —
    * the host gets a video-only stream with an error banner instead.
    *
-   * Selection rules (see CONTEXT.md):
+   * Selection rules (see `resolveAudioSelection`):
    *   - source.id starts with "screen:" → entire screen → EXCLUDE our own PID
    *     (whole-desktop audio minus our renderer's output → no echo).
-   *   - source.id is a window → resolve the window's PID via listAudioProcesses
-   *     + `findProcessBySourceName` heuristic, then INCLUDE that PID's tree.
-   *   - if the window PID can't be resolved → fall back to `{ system: true }`.
+   *   - source.id is a window → resolve its PID via the AUTHORITATIVE
+   *     HWND→PID path (`getPidFromSourceId`, via user32!GetWindowThreadProcessId)
+   *     FIRST, then fall back to the name-matching heuristic
+   *     (`listAudioProcesses` + `findProcessBySourceName`); INCLUDE that PID's
+   *     tree. Only when both fail do we fall back to `{ system: true }`
+   *     (which may cause echo — UI labels it accordingly).
    *
    * @param source The video source the host just picked in `<SourcePicker>`.
    */

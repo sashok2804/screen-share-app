@@ -122,6 +122,20 @@ declare global {
       listAudioProcesses?: () => Promise<AudioProcess[]>;
 
       /**
+       * Authoritatively resolve the owning PID of a desktopCapturer window
+       * source by parsing the Win32 HWND out of `source.id`
+       * (`"window:<HWND>:..."`) and calling
+       * `user32!GetWindowThreadProcessId` via PowerShell P/Invoke. This is the
+       * deterministic path tried FIRST — the `listAudioProcesses` name
+       * heuristic is kept only as a fallback.
+       *
+       * @param sourceId desktopCapturer source.id (`"window:<HWND>:..."`).
+       * @returns PID on success, `null` when the HWND can't be resolved
+       *   (non-Windows, malformed id, invalid HWND, PowerShell failure).
+       */
+      getPidFromSourceId?: (sourceId: string) => Promise<number | null>;
+
+      /**
        * Returns the main process's own PID (`process.processId`). Used for the
        * "entire screen" audio path so we can pass it as `excludePid` and grab
        * the whole desktop minus our own renderer's audio → no echo.
