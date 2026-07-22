@@ -66,11 +66,24 @@ export function sortCodecsByPriority(
  * Applies the codec preference order to a transceiver, using the *browser's*
  * own capability list as the source (so we never pass an unsupported codec).
  *
- * Robust against Chrome's `InvalidModificationError`: capability lists contain
- * helper payload formats (rtx/red/ulpfec/flexfec) and the bare `video/H264`
- * entry that Chrome refuses inside `setCodecPreferences`. We filter those out
- * first; if nothing survives, or if Chrome still rejects the list, we log a
- * warning and return `null` rather than throwing.
+ * **CRITICAL:** per MDN and the WebRTC working group, the codec list passed to
+ * `setCodecPreferences()` MUST be a subset of the codecs returned by
+ * `RTCRtpReceiver.getCapabilities(kind)` — NOT `RTCRtpSender.getCapabilities()`.
+ * H264 in particular is reported by the sender and receiver as DIFFERENT codec
+ * objects (different `sdpFmtpLine`), so passing a sender-derived H264 entry
+ * makes Chrome 131+ throw `InvalidModificationError: invalid codec with name
+ * "H264"` (see screego/server#215). The caller is therefore required to pass
+ * `RTCRtpReceiver.getCapabilities` as `getCapabilities`.
+ *
+ * Robustness strategy:
+ *   1. Filter out non-real codecs (rtx/red/ulpfec/flexfec) that Chrome reports
+ *      in capabilities but rejects in `setCodecPreferences`.
+ *   2. Try the full prioritised list.
+ *   3. On rejection (known Chrome regression with H264 — some setups are
+ *      decode-only / unidirectional), retry WITHOUT H264.
+ *   4. On a second rejection, retry WITHOUT H264 and WITHOUT VP9 (some
+ *      sandboxes expose only AV1 + VP8).
+ *   5. If everything fails, log and return `null` rather than throwing.
  *
  * Returns the filtered/reordered codec list actually handed to
  * `setCodecPreferences`, or `null` if we deliberately skipped the call.
@@ -78,13 +91,13 @@ export function sortCodecsByPriority(
 export function applyCodecPreferences(
   transceiver: TransceiverLike,
   kind: 'audio' | 'video',
+  // CRITICAL: caller must pass RTCRtpReceiver.getCapabilities, NOT sender.
   getCapabilities: (kind: 'audio' | 'video') => RtpCapabilitiesLike | null,
 ): Array<{ mimeType: string }> | null {
   const caps = getCapabilities(kind);
   if (!caps?.codecs?.length) return null;
 
-  // Filter out non-real codecs (rtx/red/flexfec/ulpfec and friends) that
-  // Chrome reports in capabilities but rejects in setCodecPreferences.
+  // Step 1: filter to real codecs only (no rtx/red/ulpfec/flexfec).
   // For audio we pass everything through — the helper formats are rare and
   // we never observed Chrome rejecting an audio preference list.
   const realCodecs = caps.codecs.filter((c) => {
@@ -99,14 +112,54 @@ export function applyCodecPreferences(
     return null;
   }
 
+  // Step 2: sort by priority AV1 > VP9 > VP8 > H264.
   const ordered = sortCodecsByPriority(realCodecs);
-  try {
-    transceiver.setCodecPreferences(ordered);
-    return ordered;
-  } catch (err) {
-    console.warn('[rtc] setCodecPreferences rejected the list, skipping:', err);
-    return null;
+
+  // Step 3: try to apply. If H264 causes InvalidModificationError
+  // (known Chrome bug, unidirectional codec support), retry without H264.
+  const tryApply = (list: Array<{ mimeType: string }>): boolean => {
+    try {
+      transceiver.setCodecPreferences(list);
+      return true;
+    } catch (err) {
+      console.warn(
+        '[rtc] setCodecPreferences rejected list:',
+        list.map((c) => c.mimeType).join(','),
+        '— error:',
+        err instanceof Error ? err.message : String(err),
+      );
+      return false;
+    }
+  };
+
+  if (tryApply(ordered)) return ordered;
+
+  // Fallback 1: drop H264 and retry.
+  const withoutH264 = ordered.filter(
+    (c) => !c.mimeType.toLowerCase().includes('h264'),
+  );
+  if (withoutH264.length > 0 && tryApply(withoutH264)) {
+    console.log(
+      '[rtc] codec preferences applied without H264:',
+      withoutH264.map((c) => c.mimeType).join(','),
+    );
+    return withoutH264;
   }
+
+  // Fallback 2: drop VP9 too (some setups only have AV1+VP8).
+  const minimal = withoutH264.filter(
+    (c) => !c.mimeType.toLowerCase().includes('vp9'),
+  );
+  if (minimal.length > 0 && tryApply(minimal)) {
+    console.log(
+      '[rtc] codec preferences applied (no H264, no VP9):',
+      minimal.map((c) => c.mimeType).join(','),
+    );
+    return minimal;
+  }
+
+  console.warn('[rtc] all codec preference attempts failed, leaving defaults');
+  return null;
 }
 
 /**

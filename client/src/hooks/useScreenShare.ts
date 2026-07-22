@@ -211,12 +211,16 @@ export function useScreenShare(
     (track: MediaStreamTrack, preset: QualityPreset) => {
       // Codec preferences first (requires the transceiver, not the sender).
       mesh.forEachVideoTransceiver((transceiver) => {
+        // CRITICAL: pass RTCRtpReceiver.getCapabilities, NOT sender. The codec
+        // list handed to setCodecPreferences must be a subset of the RECEIVER
+        // capabilities; using sender caps (especially H264) triggers Chrome's
+        // InvalidModificationError regression (screego/server#215).
         applyCodecPreferences(
           transceiver as unknown as Parameters<typeof applyCodecPreferences>[0],
           'video',
           (kind) =>
-            typeof RTCRtpSender !== 'undefined'
-              ? (RTCRtpSender.getCapabilities(kind) as { codecs?: Array<{ mimeType: string }> } | null)
+            typeof RTCRtpReceiver !== 'undefined'
+              ? (RTCRtpReceiver.getCapabilities(kind) as { codecs?: Array<{ mimeType: string }> } | null)
               : null,
         );
       });

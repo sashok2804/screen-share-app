@@ -86,9 +86,12 @@ const RING_SIZE = 16384;
  *      `Стерео микшер` (Russian), `Что слышно` (Russian UI), `Wave Out`,
  *      `Loopback`, anything with `Mix` as a whole word. These are frequently
  *      disabled by default but are exactly what we want when present.
- *   2. Voicemeeter HARDWARE outputs — `Voicemeeter Out A1/A2/A3` (the physical
- *      speakers/headphones). These show up in dshow as capture endpoints and
- *      represent the actual loopback signal.
+ *   2. Voicemeeter HARDWARE outputs in order — `Voicemeeter Out A1` first
+ *      (the typical speakers/headphones output), then `A2`, `A3`, then a
+ *      catch-all `A\d` for the rest. A1 is listed explicitly because the
+ *      dshow enumeration order is not stable: on many installs `A4` sorts
+ *      before `A1`, and without an explicit rule the picker chose `A4`
+ *      (often not wired to anything) and peers heard silence.
  *   3. `Voicemeeter VAIO` (`Voicemeeter Input`) — captures whatever is routed
  *      into the mixer.
  *
@@ -107,6 +110,13 @@ const RING_SIZE = 16384;
  * @returns the chosen device name (guaranteed non-empty if `devices` is).
  */
 export function pickDefaultAudioDevice(devices: string[]): string {
+  // Priority order: try most-specific patterns first.
+  // The Voicemeeter block lists each hardware A-output by number before the
+  // generic `A\d` fallback, so A1 (typical speakers/headphones) is picked over
+  // A2/A3/A4 even when A4 sorts earlier in the dshow enumeration. With a single
+  // `/Voicemeeter Out A\d/i` rule the regex matched the FIRST device in array
+  // order — which on real installs is frequently A4 (not wired to anything),
+  // so peers heard silence.
   const priority = [
     /Stereo Mix/i,
     /Стерео микшер/i,
@@ -114,8 +124,11 @@ export function pickDefaultAudioDevice(devices: string[]): string {
     /Wave Out/i,
     /Loopback/i,
     /Mix\b/i,
-    // Voicemeeter hardware outputs — physical speakers/headphones.
-    /Voicemeeter Out A\d/i,
+    // Voicemeeter HARDWARE OUT — A1 is the typical speakers/headphones output.
+    /Voicemeeter Out A1/i,
+    /Voicemeeter Out A2/i,
+    /Voicemeeter Out A3/i,
+    /Voicemeeter Out A\d/i, // fallback for other A-devices (A4, A5, ...)
     /Voicemeeter VAIO/i,
   ];
   for (const pattern of priority) {
