@@ -222,6 +222,10 @@ export function Room({ roomId, name, onLeave }: RoomProps) {
             aecEnabled={screen.aecEnabled}
             onToggleAec={screen.setAecEnabled}
             audioViaFfmpeg={screen.audioViaFfmpeg}
+            isElectron={screen.isElectron}
+            audioDevices={screen.audioDevices}
+            selectedAudioDevice={screen.selectedAudioDevice}
+            onPickAudioDevice={screen.setAudioDevice}
           />
         </div>
 

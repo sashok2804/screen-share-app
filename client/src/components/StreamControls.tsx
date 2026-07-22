@@ -19,6 +19,14 @@ export interface StreamControlsProps {
    * WASAPI bridge (no browser fallback path, no echo loop).
    */
   audioViaFfmpeg?: boolean;
+  /** Phase 3 — running inside the Electron desktop client. */
+  isElectron?: boolean;
+  /** Phase 3 — DirectShow audio device names for the dropdown. */
+  audioDevices?: string[];
+  /** Phase 3 — the user's selection, or null for "auto". */
+  selectedAudioDevice?: string | null;
+  /** Phase 3 — change the selection. `null` restores "auto". */
+  onPickAudioDevice?: (name: string | null) => void;
 }
 
 export function StreamControls({
@@ -32,6 +40,10 @@ export function StreamControls({
   errorMessage,
   aecEnabled,
   audioViaFfmpeg,
+  isElectron,
+  audioDevices,
+  selectedAudioDevice,
+  onPickAudioDevice,
 }: StreamControlsProps) {
   if (!isHost) {
     return (
@@ -57,6 +69,35 @@ export function StreamControls({
           {hostStreaming ? '● LIVE' : '○ остановлено'}
         </span>
       </div>
+
+      {isElectron && audioDevices && audioDevices.length > 0 && onPickAudioDevice && (
+        <div className="space-y-1">
+          <label
+            htmlFor="audio-device-select"
+            className="block text-[11px] font-medium text-slate-400"
+          >
+            Источник звука (системный аудио через FFmpeg)
+          </label>
+          <select
+            id="audio-device-select"
+            value={selectedAudioDevice ?? ''}
+            onChange={(e) => onPickAudioDevice(e.target.value || null)}
+            className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-500"
+          >
+            <option value="">Авто (Voicemeeter / CABLE)</option>
+            {audioDevices.map((d) => (
+              <option key={d} value={d}>
+                {d}
+              </option>
+            ))}
+          </select>
+          {hostStreaming && (
+            <p className="text-[10px] text-slate-500">
+              Изменения вступят в силу при следующем запуске стрима.
+            </p>
+          )}
+        </div>
+      )}
 
       {!hostStreaming ? (
         <>

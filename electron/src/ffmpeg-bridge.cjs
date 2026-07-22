@@ -78,19 +78,27 @@ class FFmpegAudioCapture extends EventEmitter {
   /**
    * Build the ffmpeg argv for the current input format.
    * Output is always raw f32le on stdout.
+   *
+   * Throws if no device name was provided — we deliberately do NOT fall back
+   * to FFmpeg's `dummy` input: that device does not exist on a stock Windows
+   * install, so FFmpeg exits with code 1 and the renderer surfaces a cryptic
+   * "user aborted a request" error. The caller (renderer) is responsible for
+   * picking a real device via `listAudioDevices()` first.
+   *
    * @private
    */
   _buildArgs(format) {
-    const inputArg =
-      this.deviceName && this.deviceName.length > 0
-        ? `audio=${this.deviceName}`
-        : 'dummy';
+    if (!this.deviceName || this.deviceName.length === 0) {
+      throw new Error(
+        'No audio device specified. Call listAudioDevices() and pick one.',
+      );
+    }
 
     return [
       '-hide_banner',
       '-loglevel', 'warning',
       '-f', format,
-      '-i', inputArg,
+      '-i', `audio=${this.deviceName}`,
       '-ac', String(this.channels),
       '-ar', String(this.sampleRate),
       '-f', 'f32le',

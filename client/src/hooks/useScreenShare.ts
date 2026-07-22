@@ -66,6 +66,21 @@ export interface UseScreenShareResult {
    * `<SourcePicker onCancel>`.
    */
   cancelSource: () => void;
+
+  // ---- Phase 3: Electron audio device picker ----------------------------
+  /**
+   * DirectShow audio device names available on this machine (Electron only).
+   * Empty in the browser build or before the initial `listAudioDevices()` call
+   * resolves.
+   */
+  audioDevices: string[];
+  /**
+   * The device the user picked in the dropdown, or `null` for "auto" (let the
+   * hook pick a sensible default — see `pickDefaultAudioDevice`).
+   */
+  selectedAudioDevice: string | null;
+  /** Set or clear the user's audio device choice. `null` means "auto". */
+  setAudioDevice: (name: string | null) => void;
 }
 
 /**
@@ -101,6 +116,34 @@ export function useScreenShare(
   /** True iff we are publishing system audio captured via FFmpeg (Electron). */
   const [audioViaFfmpeg, setAudioViaFfmpeg] = useState(false);
 
+  // `true` when running inside the Electron desktop client. Computed once at
+  // the top so every Electron-gated branch (including the device-loading
+  // effect below) can read it without reordering declarations.
+  const isElectron =
+    typeof window !== 'undefined' && window.electronAPI?.isElectron === true;
+
+  // Phase 3 — list of DirectShow audio devices + the user's selection. The
+  // dropdown lets the host override our heuristic default picker. `null`
+  // means "auto" (the hook / useProcessAudio picks a loopback device).
+  const [audioDevices, setAudioDevices] = useState<string[]>([]);
+  const [selectedAudioDevice, setSelectedAudioDevice] = useState<string | null>(null);
+  useEffect(() => {
+    if (!isElectron || !window.electronAPI?.listAudioDevices) return;
+    let cancelled = false;
+    window.electronAPI
+      .listAudioDevices()
+      .then((res) => {
+        if (cancelled) return;
+        setAudioDevices(res?.audio ?? []);
+      })
+      .catch((err) => {
+        console.error('[screen-share] listAudioDevices failed:', err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isElectron]);
+
   const streamRef = useRef<MediaStream | null>(null);
   const videoTrackRef = useRef<MediaStreamTrack | null>(null);
   const audioTrackRef = useRef<MediaStreamTrack | null>(null);
@@ -122,8 +165,6 @@ export function useScreenShare(
   // `stopStream` as a safety net) call `cancelSource`, which rejects. This
   // keeps the async flow inside `startStream` without leaking modal state into
   // the call site.
-  const isElectron =
-    typeof window !== 'undefined' && window.electronAPI?.isElectron === true;
   const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
   /** Pending picker resolver: set when the modal opens, cleared on resolve. */
   const pendingSourceRef = useRef<{
@@ -311,7 +352,11 @@ export function useScreenShare(
           // audio. Surface the error via the existing `error` channel.
           void (async () => {
             try {
-              const track = await processAudio.start();
+              // `selectedAudioDevice` is null → "auto" → useProcessAudio picks
+              // a sensible loopback default (Voicemeeter / CABLE / Stereo Mix).
+              const track = await processAudio.start(
+                selectedAudioDevice ?? undefined,
+              );
               if (track) {
                 audioTrackRef.current = track;
                 mesh.publishAudio(track);
@@ -352,7 +397,7 @@ export function useScreenShare(
         }
       }
     },
-    [isElectron, mesh, room, configureVideoSenders, requestSourceFromPicker, publishCapturedMedia, processAudio],
+    [isElectron, mesh, room, configureVideoSenders, requestSourceFromPicker, publishCapturedMedia, processAudio, selectedAudioDevice],
   );
 
   // Keep the ref pointing at the latest stopStream (so the track's 'ended'
@@ -413,6 +458,9 @@ export function useScreenShare(
     // Phase 3
     isElectron,
     audioViaFfmpeg,
+    audioDevices,
+    selectedAudioDevice,
+    setAudioDevice: setSelectedAudioDevice,
     // Phase 2
     sourcePickerOpen,
     confirmSource,

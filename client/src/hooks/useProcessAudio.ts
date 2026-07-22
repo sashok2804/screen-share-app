@@ -32,6 +32,10 @@ export interface UseProcessAudioResult {
   /**
    * Start capturing. Returns the resulting audio track, or null on failure
    * (including the browser-build no-op case and missing FFmpeg).
+   *
+   * If `deviceName` is omitted, the hook calls `listAudioDevices()` and picks a
+   * sensible default (preferring virtual loopback devices like Voicemeeter /
+   * VB-Audio Virtual Cable over microphones). See `pickDefaultAudioDevice`.
    */
   start: (deviceName?: string) => Promise<MediaStreamTrack | null>;
   /** Stop the capture and release all resources. Safe to call when idle. */
@@ -40,6 +44,41 @@ export interface UseProcessAudioResult {
 
 const TARGET_SAMPLE_RATE = 48000;
 const TARGET_CHANNELS = 1;
+
+/**
+ * Heuristic default-device picker for DirectShow audio capture.
+ *
+ * On a stock Windows install FFmpeg's "default" input is effectively unusable
+ * for loopback (it tends to grab the default microphone), and there is no
+ * `dummy` device either. So when the caller does not name a device we prefer,
+ * in order:
+ *   1. Virtual loopback sinks that the user installed precisely for this
+ *      purpose — Voicemeeter Out B1 / AUX, VB-Audio Virtual Cable ("CABLE
+ *      Output"), Stereo Mix, Wave Out Mix, anything labelled "Loopback".
+ *   2. The first device that doesn't look like a microphone.
+ *   3. The first device, whatever it is.
+ *
+ * Exported so the picker can be unit-tested independently of the hook.
+ *
+ * @param devices  DirectShow audio device names from `listAudioDevices()`.
+ * @returns the chosen device name (guaranteed non-empty if `devices` is).
+ */
+export function pickDefaultAudioDevice(devices: string[]): string {
+  const priority = [
+    /Voicemeeter Out B1/i,
+    /Voicemeeter AUX/i,
+    /CABLE Output/i,
+    /Stereo Mix/i,
+    /Wave Out/i,
+    /Loopback/i,
+  ];
+  for (const pattern of priority) {
+    const match = devices.find((d) => pattern.test(d));
+    if (match) return match;
+  }
+  const nonMic = devices.find((d) => !/микрофон|microphone|mic/i.test(d));
+  return nonMic ?? devices[0];
+}
 
 export function useProcessAudio(): UseProcessAudioResult {
   const isElectron =
@@ -123,6 +162,31 @@ export function useProcessAudio(): UseProcessAudioResult {
       // Clean up any prior session before starting a new one.
       await teardown();
       setError(null);
+
+      // If the caller did not name a device, try to pick a sensible default
+      // (virtual loopback sink > microphone). We never want to send an empty
+      // name down to FFmpeg — that resolves to the non-existent `dummy` device
+      // and the capture exits with code 1 ("user aborted a request" in the UI).
+      if (!deviceName) {
+        try {
+          const devices = await api.listAudioDevices?.();
+          const audioDevices = devices?.audio ?? [];
+          if (audioDevices.length === 0) {
+            setError(
+              'No audio capture devices found. Install VB-Cable or enable Stereo Mix.',
+            );
+            return null;
+          }
+          deviceName = pickDefaultAudioDevice(audioDevices);
+          // eslint-disable-next-line no-console
+          console.log('[useProcessAudio] auto-picked device:', deviceName);
+        } catch (err) {
+          console.error('[useProcessAudio] listAudioDevices failed:', err);
+          // Fall through — the empty name will be rejected by the main process
+          // with a clearer "No audio device specified" message than the old
+          // `dummy` exit-1 path.
+        }
+      }
 
       try {
         // 1) Set up the AudioContext + worklet BEFORE starting FFmpeg so the
