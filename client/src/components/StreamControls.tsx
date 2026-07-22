@@ -43,11 +43,6 @@ export function StreamControls({
   isElectron,
   selectedAudioLabel,
 }: StreamControlsProps) {
-  // `aecEnabled` / `onToggleAec` are no longer surfaced in the UI (the AEC
-  // worklet was removed and the Electron path is echo-free by construction),
-  // but the prop shape is preserved for back-compat with callers/tests.
-  void aecEnabled;
-
   if (!isHost) {
     return (
       <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-400">
