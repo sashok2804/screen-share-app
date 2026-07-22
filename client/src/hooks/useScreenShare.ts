@@ -9,7 +9,7 @@ import {
   type QualityPresetId,
 } from '../lib/quality';
 import { applyBitrate, applyCodecPreferences } from '../lib/rtc';
-import type { AudioSourceSelection, ElectronSource } from '../electron';
+import type { AudioProcess, ElectronSource, StartProcessAudioOptions } from '../electron';
 
 export interface ActiveStream {
   preset: QualityPreset;
@@ -19,6 +19,142 @@ export interface ActiveStream {
   frameRate: number;
   /** Whether the captured source provides audio. */
   hasAudio: boolean;
+}
+
+/**
+ * Heuristic: resolve the chosen video window source to a PID by matching its
+ * `name` against the running-process list from `audio:listProcesses`.
+ *
+ * Why we need this: Electron's `desktopCapturer.getSources()` does NOT expose
+ * the PID behind a window source (only `id`, `name`, `display_id`). The
+ * `audio:listProcesses` IPC returns `{ pid, name, title }` from PowerShell
+ * `Get-Process`, so we join on names. The matching is intentionally fuzzy:
+ *
+ *   - source.name for a window is usually the window title (e.g.
+ *     "YouTube — Google Chrome", "Minecraft 1.20", "Discord").
+ *   - We try several strategies in order and return the first hit:
+ *       1. exact equality between source.name and process.title
+ *       2. process.title contains source.name (or vice versa)
+ *       3. source.name contains process.name (e.g. "Google Chrome" → "chrome")
+ *       4. process.name contains a leading token of source.name
+ *
+ * Returns `null` when nothing matches — caller falls back to `{ system: true }`.
+ * Pure function (no React state) so it's easy to unit-test in isolation.
+ *
+ * @param processes Result of `window.electronAPI.listAudioProcesses()`.
+ * @param sourceName The `ElectronSource.name` of the chosen window source.
+ */
+export function findProcessBySourceName(
+  processes: AudioProcess[],
+  sourceName: string,
+): AudioProcess | null {
+  if (!processes || processes.length === 0) return null;
+  const name = (sourceName ?? '').trim();
+  if (!name) return null;
+  const nameLower = name.toLowerCase();
+
+  // (1) Exact title match — most precise.
+  let hit = processes.find((p) => p.title && p.title === name);
+  if (hit) return hit;
+
+  // (2) Title contains source.name or vice versa.
+  hit = processes.find(
+    (p) =>
+      (p.title && (p.title.includes(name) || name.includes(p.title))) ||
+      false,
+  );
+  if (hit) return hit;
+
+  // (3) source.name contains process.name (e.g. "...Google Chrome" → "chrome").
+  hit = processes.find((p) => p.name && p.name.length > 1 && nameLower.includes(p.name.toLowerCase()));
+  if (hit) return hit;
+
+  // (4) Leading token of source.name matches process.name. Handles window
+  //     titles like "Minecraft 1.20" where "Minecraft" itself isn't a process
+  //     name but might appear as one (rare; safety net).
+  const firstToken = nameLower.split(/[\s—\-_·]+/).find((t) => t.length > 1);
+  if (firstToken) {
+    hit = processes.find(
+      (p) => p.name && p.name.toLowerCase() === firstToken,
+    );
+    if (hit) return hit;
+  }
+
+  return null;
+}
+
+/**
+ * Decide the WASAPI loopback selection (`StartProcessAudioOptions`) for the
+ * chosen video source. Pure async helper — does NOT touch React state or
+ * `processAudio.start`; the caller wires the result into the hook.
+ *
+ *   - screen source (source.id starts with "screen:") → EXCLUDE our own PID.
+ *     Captures the whole desktop minus our renderer's audio → no echo.
+ *   - window source → resolve PID via `listAudioProcesses` + heuristic; if
+ *     found, INCLUDE that PID's tree; otherwise fall back to system audio.
+ *
+ * @param source The video source the host picked in `<SourcePicker>`.
+ * @returns The `StartProcessAudioOptions` to pass to `processAudio.start`.
+ */
+async function resolveAudioSelection(source: ElectronSource): Promise<StartProcessAudioOptions> {
+  const api = typeof window !== 'undefined' ? window.electronAPI : undefined;
+
+  // Entire screen → exclude ourselves.
+  if (source.id.startsWith('screen:')) {
+    if (api?.getElectronPid) {
+      try {
+        const pid = await api.getElectronPid();
+        if (typeof pid === 'number' && pid > 0) {
+          return { excludePid: pid };
+        }
+      } catch (err) {
+        console.warn('[screen-share] getElectronPid failed, falling back to system audio', err);
+      }
+    }
+    // Couldn't get our own PID (rare; preload bridge missing?) — degrade to
+    // classic whole-endpoint loopback. The host may hear echo, but at least
+    // they get audio.
+    return { system: true };
+  }
+
+  // Window → try to resolve the PID.
+  if (api?.listAudioProcesses) {
+    try {
+      const processes = await api.listAudioProcesses();
+      const match = findProcessBySourceName(processes, source.name);
+      if (match && typeof match.pid === 'number') {
+        return { pid: match.pid };
+      }
+    } catch (err) {
+      console.warn('[screen-share] listAudioProcesses failed, falling back to system audio', err);
+    }
+  }
+
+  // Fallback: whole default render endpoint (classic WASAPI loopback).
+  return { system: true };
+}
+
+/**
+ * Human-readable label for the auto-picked audio source. Used in the UI so the
+ * host can see what audio is being captured without a separate modal.
+ *
+ * @param source The video source the host picked.
+ * @param opts   The selection that `resolveAudioSelection` produced.
+ */
+function describeAudioSelection(
+  source: ElectronSource,
+  opts: StartProcessAudioOptions,
+): string {
+  if (opts.excludePid !== undefined) {
+    return 'Весь экран, кроме этого приложения';
+  }
+  if (opts.pid !== undefined) {
+    // Use the source name verbatim — it's the window title (e.g. "Discord",
+    // "YouTube — Google Chrome"). Truncate so the chip stays compact.
+    const name = (source.name ?? '').trim();
+    return name.length > 32 ? `${name.slice(0, 31)}…` : name || 'Выбранное приложение';
+  }
+  return 'Системный звук';
 }
 
 export interface UseScreenShareResult {
@@ -44,12 +180,13 @@ export interface UseScreenShareResult {
   isElectron: boolean;
   /**
    * True when audio is being captured via the loopback-capture WASAPI bridge
-   * (Electron-only). When true the `hasAudio` flag on `stream` reflects that
-   * audio, and the existing system-loopback AEC path should NOT activate.
+   * (Electron-only, auto-selected based on the video source). When true the
+   * `hasAudio` flag on `stream` reflects that audio, and the existing
+   * system-loopback AEC path should NOT activate.
    */
   audioViaFfmpeg: boolean;
 
-  // ---- Phase 2: Electron source picker ---------------------------------
+  // ---- Phase 2: Electron source picker ----------------------------------
   /**
    * `true` while waiting for the user to pick a source in the custom
    * SourcePicker modal (Electron only). The host component should render
@@ -67,24 +204,11 @@ export interface UseScreenShareResult {
    */
   cancelSource: () => void;
 
-  // ---- Phase 3: Electron audio source picker ----------------------------
   /**
-   * `true` while the audio-source picker (`<ProcessAudioPicker>`) is open.
-   * The host component should render it conditionally and wire
-   * `confirmAudioSource` / `cancelAudioSource`.
-   */
-  audioPickerOpen: boolean;
-  /** Open the ProcessAudioPicker modal. */
-  openAudioPicker: () => void;
-  /** Resolve the picker with the user's choice and start capture. */
-  confirmAudioSource: (selection: AudioSourceSelection) => void;
-  /** Resolve the picker with a cancellation (no audio change). */
-  cancelAudioSource: () => void;
-  /** Stop capturing application audio (revert to video-only). */
-  stopProcessAudio: () => void;
-  /**
-   * Human-readable label of the active audio source (e.g. "Spotify" or
-   * "Системный звук"), or `null` when no audio source is selected.
+   * Human-readable label of the automatically-selected audio source (e.g.
+   * "Chrome", "Весь экран, кроме этого приложения" or "Системный звук"), or
+   * `null` when no audio source is active (e.g. video-only because audio
+   * capture failed).
    */
   selectedAudioLabel: string | null;
 }
@@ -128,7 +252,7 @@ export function useScreenShare(
     typeof window !== 'undefined' && window.electronAPI?.isElectron === true;
 
   // Refs are declared up-front so every callback below (including the audio
-  // picker helpers, which touch audioTrackRef) can reference them safely.
+  // auto-picker, which touches audioTrackRef) can reference them safely.
   const streamRef = useRef<MediaStream | null>(null);
   const videoTrackRef = useRef<MediaStreamTrack | null>(null);
   const audioTrackRef = useRef<MediaStreamTrack | null>(null);
@@ -139,84 +263,71 @@ export function useScreenShare(
   /** Holds the latest stopStream so the 'ended' handler can call it safely. */
   const stopRef = useRef<() => void>(() => {});
 
-  // Phase 3 (rewritten) — audio source selection. Unlike the old device-
-  // dropdown model, the host now picks an audio source via the
-  // `<ProcessAudioPicker>` modal AFTER starting video, on demand. `null` means
-  // "no audio source selected" (video-only stream).
-  const [audioPickerOpen, setAudioPickerOpen] = useState(false);
-  /** Human-readable label for the currently-active source (UI feedback). */
+  /**
+   * Human-readable label for the currently-active audio source (UI feedback).
+   * Set by the auto-pick path after the video source is chosen.
+   */
   const [selectedAudioLabel, setSelectedAudioLabel] = useState<string | null>(null);
 
   /**
-   * Resolve the picker with the user's choice AND start the loopback capture
-   * immediately. The async pipeline (stop any prior capture → start new →
-   * publish audio track → flag hasAudio) is fire-and-forget: errors surface
+   * Auto-pick the audio source based on the chosen video source and start
+   * WASAPI loopback capture. Called from `startStream` right after the video
+   * track has been published. The pipeline is fire-and-forget: errors surface
    * through `error`/`processAudio.error` rather than rejecting a promise the
-   * UI isn't awaiting.
+   * caller isn't awaiting. The video stream is NOT reverted if audio fails —
+   * the host gets a video-only stream with an error banner instead.
+   *
+   * Selection rules (see CONTEXT.md):
+   *   - source.id starts with "screen:" → entire screen → EXCLUDE our own PID
+   *     (whole-desktop audio minus our renderer's output → no echo).
+   *   - source.id is a window → resolve the window's PID via listAudioProcesses
+   *     + `findProcessBySourceName` heuristic, then INCLUDE that PID's tree.
+   *   - if the window PID can't be resolved → fall back to `{ system: true }`.
+   *
+   * @param source The video source the host just picked in `<SourcePicker>`.
    */
-  const confirmAudioSource = useCallback((selection: AudioSourceSelection) => {
-    setAudioPickerOpen(false);
-    void (async () => {
-      try {
-        // Tear down any prior loopback capture so the new selection replaces it.
-        await processAudio.stop();
-        if (audioViaFfmpeg) {
-          mesh.unpublishAudio();
-          if (audioTrackRef.current) {
-            audioTrackRef.current.stop();
-            audioTrackRef.current = null;
+  const autoStartAudioForSource = useCallback(
+    (source: ElectronSource) => {
+      // Browser build / Electron with no API → no-op. The browser path still
+      // goes through `getDisplayMedia` with `audio: true` and is handled by the
+      // caller separately.
+      if (!isElectron || !window.electronAPI) return;
+      void (async () => {
+        try {
+          await processAudio.stop();
+          if (audioViaFfmpeg) {
+            mesh.unpublishAudio();
+            if (audioTrackRef.current) {
+              audioTrackRef.current.stop();
+              audioTrackRef.current = null;
+            }
+            setAudioViaFfmpeg(false);
           }
-          setAudioViaFfmpeg(false);
-        }
 
-        const track = await processAudio.start(selection);
-        if (!track) {
-          const msg = processAudio.error ?? 'Не удалось запустить захват звука';
+          const opts = await resolveAudioSelection(source);
+          const label = describeAudioSelection(source, opts);
+          const track = await processAudio.start(opts);
+          if (!track) {
+            const msg = processAudio.error ?? 'Не удалось запустить захват звука';
+            setError(`Звук: ${msg}`);
+            setSelectedAudioLabel(null);
+            return;
+          }
+          audioTrackRef.current = track;
+          mesh.publishAudio(track);
+          setAudioViaFfmpeg(true);
+          setStream((s) => (s ? { ...s, hasAudio: true } : s));
+          setSelectedAudioLabel(label);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error('[screen-share] autoStartAudioForSource failed:', msg);
           setError(`Звук: ${msg}`);
           setSelectedAudioLabel(null);
-          return;
         }
-        audioTrackRef.current = track;
-        mesh.publishAudio(track);
-        setAudioViaFfmpeg(true);
-        setStream((s) => (s ? { ...s, hasAudio: true } : s));
-        setSelectedAudioLabel(
-          'pid' in selection ? selection.name : 'Системный звук',
-        );
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error('[screen-share] processAudio.start failed:', msg);
-        setError(`Звук: ${msg}`);
-        setSelectedAudioLabel(null);
-      }
-    })();
-  }, [processAudio, audioViaFfmpeg, mesh]);
-
-  const cancelAudioSource = useCallback(() => {
-    setAudioPickerOpen(false);
-  }, []);
-
-  const openAudioPicker = useCallback(() => {
-    setAudioPickerOpen(true);
-  }, []);
-
-  /** Stop the loopback capture (revert to video-only). */
-  const stopProcessAudio = useCallback(() => {
-    void (async () => {
-      try {
-        await processAudio.stop();
-      } catch (err) {
-        console.error('[screen-share] stopProcessAudio failed', err);
-      }
-      if (audioViaFfmpeg) {
-        mesh.unpublishAudio();
-        audioTrackRef.current = null;
-        setAudioViaFfmpeg(false);
-        setStream((s) => (s ? { ...s, hasAudio: false } : s));
-      }
-      setSelectedAudioLabel(null);
-    })();
-  }, [processAudio, audioViaFfmpeg, mesh]);
+      })();
+    },
+    [isElectron, processAudio, audioViaFfmpeg, mesh],
+  );
 
   // ---- Phase 2: Electron source picker -----------------------------------
   //
@@ -302,12 +413,9 @@ export function useScreenShare(
   const stopStream = useCallback(() => {
     // Safety net: if the user clicks stop while the source picker is open,
     // cancel the pending promise so an awaiting startStream() doesn't hang on
-    // a resolver that will never fire. Also dismiss the audio picker.
+    // a resolver that will never fire.
     if (pendingSourceRef.current) {
       cancelSource();
-    }
-    if (audioPickerOpen) {
-      setAudioPickerOpen(false);
     }
     if (videoTrackRef.current) {
       videoTrackRef.current.stop();
@@ -334,7 +442,7 @@ export function useScreenShare(
     setIsStreaming(false);
     setStream(null);
     room.notifyStreamStop();
-  }, [mesh, room, cancelSource, processAudio, audioViaFfmpeg, audioPickerOpen]);
+  }, [mesh, room, cancelSource, processAudio, audioViaFfmpeg]);
 
   /**
    * Shared post-capture pipeline for both Electron and browser paths:
@@ -404,8 +512,7 @@ export function useScreenShare(
           // Audio is intentionally `false` here: on Electron it would hit the
           // same system-loopback echo loop we're avoiding. Application audio
           // is captured separately (echo-free) via the loopback-capture WASAPI
-          // bridge, which the host selects on demand from StreamControls →
-          // ProcessAudioPicker (see confirmAudioSource).
+          // bridge — auto-selected from the just-picked video source below.
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const media = (await navigator.mediaDevices.getUserMedia({
             audio: false,
@@ -423,6 +530,11 @@ export function useScreenShare(
           } as any)) as MediaStream;
 
           publishCapturedMedia(media, preset, presetId);
+
+          // Auto-pick audio based on the chosen video source — no separate
+          // modal. Window → INCLUDE that process's tree (echo-free per-app).
+          // Screen → EXCLUDE our own PID (whole-desktop minus ourselves).
+          autoStartAudioForSource(source);
           return;
         }
 
@@ -448,7 +560,7 @@ export function useScreenShare(
         }
       }
     },
-    [isElectron, mesh, room, configureVideoSenders, requestSourceFromPicker, publishCapturedMedia],
+    [isElectron, mesh, room, configureVideoSenders, requestSourceFromPicker, publishCapturedMedia, autoStartAudioForSource],
   );
 
   // Keep the ref pointing at the latest stopStream (so the track's 'ended'
@@ -509,11 +621,6 @@ export function useScreenShare(
     // Phase 3 (rewritten)
     isElectron,
     audioViaFfmpeg,
-    audioPickerOpen,
-    openAudioPicker,
-    confirmAudioSource,
-    cancelAudioSource,
-    stopProcessAudio,
     selectedAudioLabel,
     // Phase 2
     sourcePickerOpen,

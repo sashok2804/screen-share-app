@@ -16,11 +16,17 @@
  *               `loopback-capture` npm package. This replaces the earlier FFmpeg +
  *               DirectShow approach: instead of grabbing the system mixer (which
  *               includes the remote peer's voice coming out of our speakers →
- *               echo), we capture only the chosen process's output via
- *               `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` (the same trick
- *               Discord uses). `startSystemAudio` falls back to classic WASAPI
- *               loopback on the default render endpoint when the user wants the
- *               whole desktop. Raw PCM (16-bit signed LE, stereo, 48 kHz) is
+ *               echo), we capture via `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`
+ *               in one of two modes (the same trick Discord uses):
+ *                 • INCLUDE-target-process-tree — only the chosen process and
+ *                   its children (used when the host picks a specific window).
+ *                 • EXCLUDE-target-process-tree — everything EXCEPT the given
+ *                   process tree; we pass our own Electron PID so the capture
+ *                   includes all desktop audio minus our renderer's audio →
+ *                   echo-free "entire screen" capture (no separate audio modal).
+ *               `startSystemAudio` falls back to classic WASAPI loopback on the
+ *               default render endpoint when the chosen window's PID can't be
+ *               resolved. Raw PCM (16-bit signed LE, stereo, 48 kHz) is
  *               averaged to mono Float32 in the main process and forwarded to
  *               the renderer, where a ScriptProcessorNode feeds it into a
  *               MediaStreamAudioDestinationNode → WebRTC.
@@ -36,10 +42,16 @@ const fs = require('fs');
 
 /**
  * `loopback-capture` ships a prebuilt N-API v9 binary (no Visual Studio build
- * tools required) and only exposes `LoopbackCapture` with `start(pid, tree, cb)`,
- * `startSystemAudio(cb)` and `stop()`. On non-Windows platforms the require()
- * succeeds but the constructor logs a warning — we gate all calls behind
- * `process.platform === 'win32'` below.
+ * tools required) and only exposes `LoopbackCapture` with
+ * `start(pid, includeProcessTree, cb)`, `startSystemAudio(cb)` and `stop()`.
+ * The `includeProcessTree` flag maps directly to the Win32
+ * `PROCESS_LOOPBACK_MODE_{INCLUDE,EXCLUDE}_TARGET_PROCESS_TREE` parameter
+ * (see node_modules/loopback-capture/src/LoopbackCapture.cpp):
+ *   - `true`  → capture only `pid` and its children (per-application pick).
+ *   - `false` → capture everything EXCEPT `pid` and its children (entire-screen
+ *               pick where we pass our own Electron PID to mute ourselves).
+ * On non-Windows platforms the require() succeeds but the constructor logs a
+ * warning — we gate all calls behind `process.platform === 'win32'` below.
  */
 let loopback = null;
 try {
@@ -956,9 +968,10 @@ let currentCapture = null;
 
 /**
  * IPC: list running processes that own a visible window. Used by the renderer's
- * `ProcessAudioPicker` to let the host choose which application's audio to
- * capture (Discord-style). Returns `{ pid, name, title }[]`, always a stable
- * array — empty on non-Windows or on PowerShell failure.
+ * auto-audio heuristic to resolve a chosen video source to a PID
+ * (desktopCapturer does NOT expose the PID behind a window source, so the
+ * renderer joins on `name` / `title`). Returns `{ pid, name, title }[]`,
+ * always a stable array — empty on non-Windows or on PowerShell failure.
  *
  * Implementation note: Electron's `desktopCapturer.getSources()` does NOT
  * expose the PID behind a window source, so we can't simply join on it. We
@@ -1001,12 +1014,31 @@ ipcMain.handle('audio:listProcesses', async () => {
  * IPC: start WASAPI loopback capture. `opts` is one of:
  *   - `{ system: true }`         capture the entire default render endpoint
  *                                 (classic WASAPI loopback — everything playing).
+ *                                 Used as a fallback when the chosen window's
+ *                                 PID can't be resolved.
  *   - `{ pid: <number> }`        capture only the chosen process (and, by
- *                                 default, its child tree) via process loopback.
- *                                 This is the echo-free path: the remote peer's
- *                                 voice coming out of our speakers is owned by
- *                                 the Electron renderer process, NOT the target
- *                                 process, so it is excluded automatically.
+ *                                 default, its child tree) via process loopback
+ *                                 in INCLUDE-target-process-tree mode. This is
+ *                                 the echo-free per-application path used when
+ *                                 the host picks a specific window: the remote
+ *                                 peer's voice coming out of our speakers is
+ *                                 owned by the Electron renderer process, NOT
+ *                                 the target process, so it is excluded
+ *                                 automatically.
+ *   - `{ excludePid: <number> }` capture EVERYTHING EXCEPT the given process
+ *                                 (and its child tree) via process loopback in
+ *                                 EXCLUDE-target-process-tree mode. Used when
+ *                                 the host picks the entire screen: we pass
+ *                                 our own Electron PID (see `app:getPid`) so
+ *                                 the capture includes all desktop audio minus
+ *                                 our renderer's audio → no echo from the
+ *                                 remote peer's voice played by our window.
+ *
+ * The `loopback-capture` native module's `start(pid, includeProcessTree, cb)`
+ * maps `includeProcessTree` directly to the Win32
+ * `AUDIOCLIENT_ACTIVATION_PARAMS_PROCESS_LOOPBACK_MODE` flag — INCLUDE when
+ * `true`, EXCLUDE when `false` (see node_modules/loopback-capture/src/
+ * LoopbackCapture.cpp). That's what makes "exclude self" work.
  *
  * Resolves to `{ ok, sampleRate, channels }` on success. Chunks are pushed to
  * the renderer as `audio:chunk` events (Float32Array, mono, 48 kHz). Mid-
@@ -1038,15 +1070,27 @@ ipcMain.handle('audio:start', async (_event, rawOpts) => {
       return { ok: false, error: 'main window not available' };
     }
 
-    /** @type {{ pid?: unknown, system?: unknown }} */
+    /**
+     * @type {{ pid?: unknown, excludePid?: unknown, includeTree?: unknown, system?: unknown }}
+     */
     const opts =
       rawOpts && typeof rawOpts === 'object' ? /** @type {any} */ (rawOpts) : {};
     const wantSystem = opts.system === true;
     const pid = typeof opts.pid === 'number' ? opts.pid : null;
+    const excludePid = typeof opts.excludePid === 'number' ? opts.excludePid : null;
 
-    if (!wantSystem && pid === null) {
-      return { ok: false, error: 'Either opts.pid or opts.system must be provided' };
+    // Validate: exactly one of {system, pid, excludePid} must be provided.
+    if (!wantSystem && pid === null && excludePid === null) {
+      return {
+        ok: false,
+        error: 'Either opts.pid, opts.excludePid, or opts.system must be provided',
+      };
     }
+
+    // Default includeTree=true unless caller explicitly passes false. Only
+    // meaningful for the include-path (we always want a process's children too,
+    // e.g. a browser with helper/utility processes that emit audio).
+    const includeTree = opts.includeTree !== false;
 
     const capture = new loopback.LoopbackCapture();
 
@@ -1072,11 +1116,18 @@ ipcMain.handle('audio:start', async (_event, rawOpts) => {
 
     if (wantSystem) {
       capture.startSystemAudio(onChunk);
+    } else if (excludePid !== null) {
+      // EXCLUDE mode: capture everything EXCEPT the given PID (and its tree).
+      // includeProcessTree=false → PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE.
+      // Used for "entire screen": pass our own Electron PID so the remote
+      // peer's voice played by our renderer is excluded → echo-free.
+      capture.start(/** @type {number} */ (excludePid), false, onChunk);
     } else {
-      // includeProcessTree = true: captures the process AND any child processes
+      // INCLUDE mode: capture only the chosen process (and its tree when
+      // includeTree is true). captures the process AND any child processes
       // it spawns (e.g. a game launching a launcher, or a browser with helper
       // processes that emit audio).
-      capture.start(/** @type {number} */ (pid), true, onChunk);
+      capture.start(/** @type {number} */ (pid), includeTree, onChunk);
     }
 
     currentCapture = capture;
@@ -1092,6 +1143,29 @@ ipcMain.handle('audio:start', async (_event, rawOpts) => {
     }
     return { ok: false, error: message };
   }
+});
+
+/**
+ * IPC: return the Electron main process's own PID (`process.processId`). The
+ * renderer uses this for the "entire screen" audio path: passing our own PID
+ * as `excludePid` to `audio:start` captures the whole desktop minus our
+ * renderer's audio output → no echo from the remote peer's voice. Resolves
+ * even outside Windows (returns the Node process pid regardless) so the
+ * renderer code path doesn't need its own platform branch.
+ *
+ * @returns {Promise<number>}
+ */
+ipcMain.handle('app:getPid', async () => {
+  // `process.processId` is Electron's PID on Windows/Linux; on macOS in a
+  // packaged build it's the main process pid too. Fall back to `process.pid`
+  // (always defined) just in case.
+  const pid =
+    typeof process.processId === 'number'
+      ? process.processId
+      : typeof process.pid === 'number'
+        ? process.pid
+        : 0;
+  return pid;
 });
 
 /**

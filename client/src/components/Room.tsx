@@ -10,7 +10,6 @@ import { ParticipantList } from './ParticipantList';
 import { StreamControls } from './StreamControls';
 import { SubscribeButton } from './SubscribeButton';
 import { SourcePicker } from './SourcePicker';
-import { ProcessAudioPicker } from './ProcessAudioPicker';
 
 export interface RoomProps {
   roomId: string;
@@ -220,12 +219,8 @@ export function Room({ roomId, name, onLeave }: RoomProps) {
                 : null
             }
             errorMessage={screen.error}
-            aecEnabled={screen.aecEnabled}
-            onToggleAec={screen.setAecEnabled}
             audioViaFfmpeg={screen.audioViaFfmpeg}
             isElectron={screen.isElectron}
-            onOpenAudioPicker={screen.openAudioPicker}
-            onStopProcessAudio={screen.stopProcessAudio}
             selectedAudioLabel={screen.selectedAudioLabel}
           />
         </div>
@@ -259,19 +254,12 @@ export function Room({ roomId, name, onLeave }: RoomProps) {
       {/* Hidden audio sink for remote voice. */}
       <audio ref={voice.remoteAudioRef} autoPlay className="hidden" />
 
-      {/* Electron-only custom source picker (replaces native getDisplayMedia dialog). */}
+      {/* Electron-only custom source picker (replaces native getDisplayMedia dialog).
+          Audio is auto-selected from the chosen video source — no separate modal. */}
       {screen.sourcePickerOpen && (
         <SourcePicker
           onPick={(s) => screen.confirmSource(s)}
           onCancel={() => screen.cancelSource()}
-        />
-      )}
-
-      {/* Electron-only application-audio source picker (WASAPI loopback, no echo). */}
-      {screen.audioPickerOpen && (
-        <ProcessAudioPicker
-          onPick={(selection) => screen.confirmAudioSource(selection)}
-          onCancel={() => screen.cancelAudioSource()}
         />
       )}
 

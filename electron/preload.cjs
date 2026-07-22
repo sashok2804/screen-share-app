@@ -90,9 +90,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ---- Phase 3 (rewritten): loopback-capture WASAPI bridge ----------------
 
   /**
-   * List running processes that own a visible window, so the renderer can show
-   * an application picker for audio capture. Returns `{ pid, name, title }[]`.
-   * Empty on non-Windows or on PowerShell failure.
+   * List running processes that own a visible window. Used by the renderer's
+   * auto-audio heuristic to map a chosen video source name → PID
+   * (desktopCapturer does NOT expose the PID behind a window source, so we
+   * join on `name` / `title`). Returns `{ pid, name, title }[]`. Empty on
+   * non-Windows or on PowerShell failure.
    *
    * @returns {Promise<Array<{ pid: number, name: string, title: string }>>}
    */
@@ -102,15 +104,34 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   /**
-   * Start WASAPI loopback capture. Pass exactly one of:
-   *   - `{ system: true }` — capture the whole default render endpoint
-   *     (everything playing through the default speakers/headphones).
-   *   - `{ pid: <number> }` — capture only the chosen process (and its child
-   *     tree) via WASAPI process loopback. This is the echo-free path: the
-   *     remote peer's voice emitted by our Electron window is NOT included
-   *     because it belongs to a different process.
+   * Returns the Electron main process's own PID (`process.processId`). The
+   * renderer uses this for the "entire screen" audio path: passing our own PID
+   * as `excludePid` to `startProcessAudio` captures the whole desktop minus
+   * our renderer's audio output → no echo from the remote peer's voice.
    *
-   * @param {{ pid?: number, system?: boolean }} [opts]
+   * @returns {Promise<number>}
+   */
+  getElectronPid: async () => {
+    const result = await ipcRenderer.invoke('app:getPid');
+    return typeof result === 'number' ? result : 0;
+  },
+
+  /**
+   * Start WASAPI loopback capture. Pass exactly one of:
+   *   - `{ system: true }`   — capture the whole default render endpoint
+   *     (everything playing through the default speakers/headphones). Used as
+   *     a fallback when the chosen window's PID can't be resolved.
+   *   - `{ pid: <number> }`  — capture only the chosen process (and its child
+   *     tree) via WASAPI process loopback in INCLUDE mode. Echo-free: the
+   *     remote peer's voice emitted by our Electron window is NOT included
+   *     because it belongs to a different process. Used when the host picks a
+   *     specific application window.
+   *   - `{ excludePid: <number> }` — capture EVERYTHING EXCEPT the given
+   *     process tree (EXCLUDE mode). Used for "entire screen" picks where we
+   *     pass our own PID so the remote peer's voice (played by our renderer)
+   *     is excluded → echo-free system-wide capture.
+   *
+   * @param {{ pid?: number, excludePid?: number, includeTree?: boolean, system?: boolean }} [opts]
    * @returns {Promise<{ ok: true, sampleRate: number, channels: number } | { ok: false, error: string }>}
    */
   startProcessAudio: async (opts) => {

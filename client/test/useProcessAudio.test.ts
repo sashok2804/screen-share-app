@@ -151,6 +151,22 @@ describe('useProcessAudio — selection contract', () => {
     expect(result.current.isActive).toBe(true);
   });
 
+  it('happy path: { excludePid } → forwards excludePid to the IPC bridge (entire-screen path)', async () => {
+    const api = installMockApi();
+    const { result } = renderHook(() => useProcessAudio());
+
+    let track: MediaStreamTrack | null = null;
+    await act(async () => {
+      track = await result.current.start({ excludePid: 4321 });
+    });
+
+    expect(track).not.toBeNull();
+    expect(track?.kind).toBe('audio');
+    expect(api.startProcessAudio).toHaveBeenCalledWith({ excludePid: 4321 });
+    expect(result.current.isActive).toBe(true);
+    expect(result.current.error).toBeNull();
+  });
+
   it('surfaces a main-process failure (ok:false) as an error and tears down', async () => {
     installMockApi({
       startProcessAudio: vi.fn().mockResolvedValue({ ok: false, error: 'boom' }),

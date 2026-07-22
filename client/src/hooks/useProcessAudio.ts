@@ -45,10 +45,21 @@ export interface UseProcessAudioResult {
    * (including the browser-build no-op case, missing selection, and main-
    * process errors).
    *
-   * `opts` must be either `{ pid: <number> }` (per-process, echo-free) or
-   * `{ system: true }` (whole default render endpoint). Passing nothing is an
-   * error: the host must explicitly choose an audio source via
-   * `<ProcessAudioPicker>` before streaming.
+   * `opts` must be one of:
+   *   - `{ pid: <number> }`        — per-process capture (echo-free). Used when
+   *                                  the host picks a specific application window.
+   *   - `{ excludePid: <number> }` — capture everything EXCEPT this PID's tree.
+   *                                  Used for "entire screen" picks where we
+   *                                  pass our own Electron PID so the capture
+   *                                  includes all desktop audio minus our own
+   *                                  renderer's audio → echo-free system audio.
+   *   - `{ system: true }`         — whole default render endpoint (fallback
+   *                                  when the chosen window's PID can't be
+   *                                  resolved).
+   *
+   * Passing nothing (or none of the above) is an error: audio is now chosen
+   * automatically by `useScreenShare` based on the video source, but the
+   * underlying hook still requires an explicit selection to start.
    */
   start: (opts: StartProcessAudioOptions) => Promise<MediaStreamTrack | null>;
   /** Stop the capture and release all resources. Safe to call when idle. */
@@ -172,12 +183,13 @@ export function useProcessAudio(): UseProcessAudioResult {
         return null;
       }
 
-      // Validate the selection before doing any AudioContext work: the host
-      // must explicitly choose either a process or system audio. We never
-      // want to silently capture something the user didn't pick.
+      // Validate the selection before doing any AudioContext work: the caller
+      // must pass exactly one of {pid, excludePid, system}. We never want to
+      // silently capture something the user didn't pick.
       const hasPid = typeof opts?.pid === 'number';
+      const hasExcludePid = typeof opts?.excludePid === 'number';
       const wantSystem = opts?.system === true;
-      if (!hasPid && !wantSystem) {
+      if (!hasPid && !hasExcludePid && !wantSystem) {
         setError('Audio source not selected. Pick an application or system audio.');
         return null;
       }

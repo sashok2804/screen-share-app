@@ -38,17 +38,42 @@ export interface ProcessAudioStartErr {
 export type ProcessAudioStartResult = ProcessAudioStartOk | ProcessAudioStartErr;
 
 /**
- * Options accepted by `startProcessAudio`. Exactly one of `pid` / `system`
- * must be provided:
- *   - `{ pid }`     — per-process WASAPI loopback (Discord-style, echo-free).
- *   - `{ system }`  — whole default render endpoint (entire desktop audio).
+ * Options accepted by `startProcessAudio`. Exactly one of `pid` / `excludePid`
+ * / `system` must be provided:
+ *   - `{ pid }`        — per-process WASAPI loopback (Discord-style, echo-free).
+ *                        Captures the chosen process and (by default) its child
+ *                        tree via `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`
+ *                        with the INCLUDE-target-process-tree mode.
+ *   - `{ excludePid }` — capture EVERYTHING EXCEPT the given process tree.
+ *                        Used for "entire screen" picks: we pass our own Electron
+ *                        PID so the capture includes all system audio minus the
+ *                        remote peer's voice coming out of our own window → no
+ *                        echo, without restricting to a single process.
+ *   - `{ system }`     — whole default render endpoint (classic WASAPI
+ *                        loopback, no process filtering). Fallback when the
+ *                        host's chosen window's PID can't be resolved.
  */
 export interface StartProcessAudioOptions {
   /**
    * Target process id. Captures the process and (on the main-process side) its
-   * child tree via `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`.
+   * child tree (controlled by `includeTree`) via
+   * `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` in INCLUDE mode.
    */
   pid?: number;
+  /**
+   * Process id to EXCLUDE. Captures every process EXCEPT the given one and its
+   * children via process loopback in EXCLUDE-target-process-tree mode. Pass our
+   * own Electron PID to grab the whole desktop without re-capturing the remote
+   * peer's voice played by our renderer → echo-free "entire screen" audio.
+   */
+  excludePid?: number;
+  /**
+   * When `true` (default), include the target process's child tree. Only
+   * meaningful together with `pid`. Kept in the type so callers can opt out of
+   * the tree if a future use case ever needs to (current code always passes the
+   * default).
+   */
+  includeTree?: boolean;
   /**
    * When `true`, capture the entire default playback device (everything
    * playing through speakers/headphones) using classic WASAPI loopback.
@@ -65,9 +90,6 @@ export interface AudioProcess {
   /** Main window title (e.g. "Discord", "Menu — Spotify"). */
   title: string;
 }
-
-/** Selection made in the `ProcessAudioPicker`: either a process or system. */
-export type AudioSourceSelection = { pid: number; name: string } | { system: true };
 
 declare global {
   interface Window {
@@ -93,14 +115,27 @@ declare global {
 
       // ---- Phase 3 (rewritten): loopback-capture WASAPI bridge ------------
       /**
-       * List running processes with a visible window (for the audio picker).
-       * Returns `[]` on non-Windows or on PowerShell failure.
+       * List running processes with a visible window. Used by the auto-audio
+       * heuristic to resolve a chosen video source to a PID (source.name →
+       * process). Returns `[]` on non-Windows or on PowerShell failure.
        */
       listAudioProcesses?: () => Promise<AudioProcess[]>;
 
       /**
-       * Start WASAPI loopback capture. Pass `{ pid }` for per-process capture
-       * (echo-free) or `{ system: true }` for the whole default render endpoint.
+       * Returns the main process's own PID (`process.processId`). Used for the
+       * "entire screen" audio path so we can pass it as `excludePid` and grab
+       * the whole desktop minus our own renderer's audio → no echo.
+       */
+      getElectronPid?: () => Promise<number>;
+
+      /**
+       * Start WASAPI loopback capture. Exactly one of:
+       *   - `{ pid }`        — capture only this process (and its child tree by
+       *                         default). Echo-free because the remote peer's
+       *                         voice belongs to a different process.
+       *   - `{ excludePid }` — capture everything EXCEPT this process tree.
+       *                         Use our own PID for "entire screen" picks.
+       *   - `{ system: true }` — whole default render endpoint (no filtering).
        */
       startProcessAudio?: (
         opts?: StartProcessAudioOptions,
