@@ -3,23 +3,37 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 /**
  * Renderer-side bridge between the FFmpeg subprocess (main process) and the
  * WebRTC mesh. Receives raw Float32 PCM chunks via IPC and turns them into a
- * `MediaStreamTrack` backed by an AudioWorklet + MediaStreamAudioDestination.
+ * `MediaStreamTrack` backed by a `ScriptProcessorNode` +
+ * `MediaStreamAudioDestinationNode`.
  *
  * Flow:
  *   main: ffmpeg.exe -f dshow -i audio="..." -f f32le pipe:1
  *      ↓ (chunk: Float32Array) IPC `audio:chunk`
  *   renderer (this hook):
- *      ↓ worklet.port.postMessage(chunk)
- *   AudioWorkletProcessor → AudioNode → MediaStreamAudioDestinationNode
+ *      ↓ handleChunk() pushes into a ring buffer
+ *   ScriptProcessorNode.onaudioprocess drains the ring into its output buffer
+ *      → MediaStreamAudioDestinationNode
  *      → destination.stream.getAudioTracks()[0]
+ *
+ * Why `ScriptProcessorNode` instead of the worklet-based processor that used
+ *   to live here?
+ *   In the packaged Electron build (and on the production server) the
+ *   Content-Security-Policy is `script-src 'self' 'unsafe-inline'` — it does
+ *   NOT include `data:`. Vite inlines the module source as a
+ *   `data:text/javascript;base64,...` URL in production builds, so loading
+ *   that module is rejected by the CSP and throws an
+ *   `AbortError` ("The user aborted a request"). `ScriptProcessorNode` runs
+ *   inline on the main thread, needs no external module load and therefore no
+ *   CSP exceptions — it works in browsers and packaged Electron alike. The CPU
+ *   cost is negligible for a single mono voice-publish path.
  *
  * Only active when `window.electronAPI?.isElectron === true`. Browser builds
  * resolve to no-ops (`start()` returns null, `stop()` is a no-op).
  *
  * Audio format notes:
- *   - We request **mono** (channels: 1) from FFmpeg so the worklet ring buffer
- *     matches the WebRTC voice-publish path. If the user later wants stereo,
- *     change `channels` here and add de-interleave logic in the worklet.
+ *   - We request **mono** (channels: 1) from FFmpeg so the ring buffer matches
+ *     the WebRTC voice-publish path. If the user later wants stereo, change
+ *     `channels` here and de-interleave in `handleChunk`.
  *   - Sample rate is fixed at 48000 to match the AudioContext; the WebRTC
  *     sender will resample as needed for the codec.
  */
@@ -44,6 +58,19 @@ export interface UseProcessAudioResult {
 
 const TARGET_SAMPLE_RATE = 48000;
 const TARGET_CHANNELS = 1;
+
+/**
+ * ScriptProcessor buffer size in sample-frames. Must be a power of two in
+ * [256, 512, 1024, 2048, 4096, 8192, 16384]. 4096 ≈ 85 ms at 48 kHz — a good
+ * trade-off between latency and main-thread overhead.
+ */
+const BUFFER_SIZE = 4096;
+
+/**
+ * Ring buffer length in sample-frames. ~340 ms at 48 kHz mono — enough headroom
+ * to absorb IPC jitter without dropping samples.
+ */
+const RING_SIZE = 16384;
 
 /**
  * Heuristic default-device picker for DirectShow audio capture.
@@ -89,14 +116,25 @@ export function useProcessAudio(): UseProcessAudioResult {
 
   /** AudioContext lazily created on first start(). */
   const audioContextRef = useRef<AudioContext | null>(null);
-  /** The worklet node — kept so we can disconnect() on stop. */
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  /** The ScriptProcessorNode — kept so we can disconnect() on stop. */
+  const scriptNodeRef = useRef<ScriptProcessorNode | null>(null);
   /** The MediaStreamDestination — its `.stream` provides the track. */
   const destinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   /** Unsubscribe for `onAudioChunk` (installed on start). */
   const unsubscribeChunkRef = useRef<(() => void) | null>(null);
   /** Unsubscribe for `onAudioError` (installed on start). */
   const unsubscribeErrorRef = useRef<(() => void) | null>(null);
+
+  /**
+   * Ring buffer state. Held in refs so the `onaudioprocess` closure (created
+   * once per `start()`) can mutate them without rebinding. We deliberately use
+   * a single underlying `Float32Array` plus write/read cursors and a live
+   * sample counter — simpler and faster than shifting an array per chunk.
+   */
+  const ringBufferRef = useRef<Float32Array>(new Float32Array(RING_SIZE));
+  const writePosRef = useRef(0);
+  const readPosRef = useRef(0);
+  const bufferedRef = useRef(0);
 
   /** Tear down everything we created. Idempotent. */
   const teardown = useCallback(async () => {
@@ -116,13 +154,20 @@ export function useProcessAudio(): UseProcessAudioResult {
       }
       unsubscribeErrorRef.current = null;
     }
-    if (workletNodeRef.current) {
+    if (scriptNodeRef.current) {
       try {
-        workletNodeRef.current.disconnect();
+        // Detach the handler so no further audio callbacks fire after we
+        // start tearing things down (some engines still call once more).
+        scriptNodeRef.current.onaudioprocess = null;
       } catch {
         /* ignore */
       }
-      workletNodeRef.current = null;
+      try {
+        scriptNodeRef.current.disconnect();
+      } catch {
+        /* ignore */
+      }
+      scriptNodeRef.current = null;
     }
     if (destinationRef.current) {
       try {
@@ -143,6 +188,11 @@ export function useProcessAudio(): UseProcessAudioResult {
       }
       audioContextRef.current = null;
     }
+    // Reset the ring buffer state for the next session.
+    ringBufferRef.current = new Float32Array(RING_SIZE);
+    writePosRef.current = 0;
+    readPosRef.current = 0;
+    bufferedRef.current = 0;
     setIsActive(false);
   }, []);
 
@@ -189,8 +239,8 @@ export function useProcessAudio(): UseProcessAudioResult {
       }
 
       try {
-        // 1) Set up the AudioContext + worklet BEFORE starting FFmpeg so the
-        //    first chunk has a destination ready.
+        // 1) Set up the AudioContext + ScriptProcessor BEFORE starting FFmpeg
+        //    so the first chunk has a destination ready.
         const Ctor: typeof AudioContext =
           window.AudioContext ||
           (window as unknown as { webkitAudioContext: typeof AudioContext })
@@ -201,42 +251,71 @@ export function useProcessAudio(): UseProcessAudioResult {
           await ctx.resume().catch(() => {});
         }
 
-        await ctx.audioWorklet.addModule(
-          new URL('../workers/process-audio-worklet.js', import.meta.url).toString(),
-        );
+        // ScriptProcessorNode: 0 inputs (we feed samples ourselves from the
+        // ring buffer), 1 output (mono). `createScriptProcessor` is deprecated
+        // but still implemented by every browser and by Electron's Chromium;
+        // it is the only CSP-safe way to synthesise audio on the main thread.
+        const node = ctx.createScriptProcessor(BUFFER_SIZE, 0, 1);
+        scriptNodeRef.current = node;
 
-        const node = new AudioWorkletNode(ctx, 'process-audio-processor', {
-          numberOfInputs: 0,
-          numberOfOutputs: 1,
-          outputChannelCount: [1],
-          channelCount: 1,
-        });
-        workletNodeRef.current = node;
+        // Drain the ring buffer into the output on every audio block. We read
+        // from refs because the same closure stays attached for the lifetime
+        // of the session and the underlying values may be swapped on restart.
+        node.onaudioprocess = (event: AudioProcessingEvent) => {
+          const output = event.outputBuffer.getChannelData(0);
+          const ring = ringBufferRef.current;
+          let readPos = readPosRef.current;
+          let buffered = bufferedRef.current;
+          for (let i = 0; i < output.length; i++) {
+            if (buffered > 0) {
+              output[i] = ring[readPos];
+              readPos = (readPos + 1) % RING_SIZE;
+              buffered--;
+            } else {
+              // Underrun: emit silence rather than stalling the graph.
+              output[i] = 0;
+            }
+          }
+          readPosRef.current = readPos;
+          bufferedRef.current = buffered;
+        };
 
         const dest = ctx.createMediaStreamDestination();
         dest.channelCount = 1;
         node.connect(dest);
         destinationRef.current = dest;
 
-        // 2) Subscribe to chunk / error events.
-        unsubscribeChunkRef.current = api.onAudioChunk((chunk) => {
-          const n = node;
-          if (!n || !chunk || chunk.length === 0) return;
-          try {
-            // Transfer the Float32Array buffer to the worklet thread (zero-copy).
-            // We must copy first because the IPC payload is not in a transferable
-            // position (it's owned by the structured-clone result), but postMessage
-            // will still move it across threads cleanly here.
-            const view = chunk instanceof Float32Array
-              ? chunk
-              : new Float32Array(chunk);
-            const copy = new Float32Array(view.length);
-            copy.set(view);
-            n.port.postMessage(copy, [copy.buffer]);
-          } catch (err) {
-            console.error('[useProcessAudio] chunk postMessage failed', err);
+        // 2) Subscribe to chunk / error events. Each FFmpeg chunk is pushed
+        //    into the ring buffer; the ScriptProcessor's onaudioprocess will
+        //    pull from it on the next audio quantum.
+        const handleChunk = (chunk: Float32Array) => {
+          if (!chunk || chunk.length === 0) return;
+          const view =
+            chunk instanceof Float32Array ? chunk : new Float32Array(chunk);
+          const ring = ringBufferRef.current;
+          let writePos = writePosRef.current;
+          let readPos = readPosRef.current;
+          let buffered = bufferedRef.current;
+          for (let i = 0; i < view.length; i++) {
+            if (buffered >= RING_SIZE) {
+              // Overflow: drop the oldest sample to make room. This bounds
+              // latency at the cost of a single-sample glitch — far better
+              // than unbounded growth that would drift the whole stream.
+              readPos = (readPos + 1) % RING_SIZE;
+              buffered--;
+            }
+            ring[writePos] = view[i];
+            writePos = (writePos + 1) % RING_SIZE;
+            buffered++;
           }
-        });
+          writePosRef.current = writePos;
+          readPosRef.current = readPos;
+          bufferedRef.current = buffered;
+        };
+
+        unsubscribeChunkRef.current = api.onAudioChunk((chunk) =>
+          handleChunk(chunk),
+        );
 
         if (api.onAudioError) {
           unsubscribeErrorRef.current = api.onAudioError((payload) => {

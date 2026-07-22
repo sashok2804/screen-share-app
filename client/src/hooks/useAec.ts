@@ -80,6 +80,12 @@ async function ensureWorklet(ctx: AudioContext): Promise<void> {
  * Without this, screen-share with system audio creates a feedback loop: the
  * remote peer hears themselves through your speakers → loopback → back to them.
  */
+/**
+ * Sticky flag so we only log the packaged-Electron AEC skip once per session
+ * instead of spamming on every `process()` call (which can fire many times).
+ */
+let electronAecSkipWarned = false;
+
 export function useAec(): UseAecResult {
   const [enabled, setEnabledState] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -107,6 +113,25 @@ export function useAec(): UseAecResult {
       if (!enabled) return capture;
       if (!referenceStream) {
         // Nothing to cancel against; pass through.
+        return capture;
+      }
+
+      // Packaged Electron: the AEC worklet is loaded via a `data:` URL which
+      // the production CSP (`script-src 'self' 'unsafe-inline'`) refuses, so
+      // `ctx.audioWorklet.addModule()` throws and `process()` falls through
+      // to its catch block. In the desktop client the proper loopback fix is
+      // the FFmpeg process-audio path (see `useProcessAudio`), so we skip AEC
+      // entirely here and pass the raw capture through. Logged once per page
+      // load to avoid console spam on every `process()` call.
+      if (typeof window !== 'undefined' && window.electronAPI?.isElectron === true) {
+        if (!electronAecSkipWarned) {
+          electronAecSkipWarned = true;
+          // eslint-disable-next-line no-console
+          console.warn(
+            '[useAec] skipping AEC worklet in packaged Electron (CSP blocks data: worklet URL); using raw capture. ' +
+              'Process-loopback audio is handled by useProcessAudio instead.',
+          );
+        }
         return capture;
       }
 
