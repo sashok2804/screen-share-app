@@ -221,11 +221,28 @@ export function useMesh(
   }, [onMessage, ensurePeer, removePeer, send]);
 
   const publishAudio = useCallback((track: MediaStreamTrack) => {
+    const previous = localAudioRef.current;
     localAudioRef.current = track;
     for (const entry of peersRef.current.values()) {
-      // Avoid adding twice.
-      const already = entry.pc.getSenders().some((s) => s.track === track);
-      if (!already) entry.pc.addTrack(track);
+      // If a sender for this kind already exists, REPLACE its track instead
+      // of adding a new one. Adding a new sender mid-session causes SDP
+      // renegotiation that fails on the remote side with "Answer cannot
+      // remove m= section from already-established BUNDLE group".
+      const existingAudioSender = entry.pc.getSenders().find((s) => {
+        const t = s.track;
+        return t ? t.kind === 'audio' : false;
+      });
+      if (existingAudioSender) {
+        // Replace track without renegotiation — does not trigger onnegotiationneeded.
+        void existingAudioSender.replaceTrack(track);
+      } else {
+        // No audio sender yet — safe to add (triggers negotiation).
+        entry.pc.addTrack(track);
+      }
+    }
+    // Stop the previous track if it's different and no longer in use.
+    if (previous && previous !== track) {
+      // Don't stop the previous mic track here — the caller (mixer/voice) owns it.
     }
   }, []);
 
@@ -234,13 +251,15 @@ export function useMesh(
     localAudioRef.current = null;
     if (!track) return;
     for (const entry of peersRef.current.values()) {
+      // Mute the audio sender by replacing its track with null instead of
+      // removing it (removing breaks BUNDLE renegotiation the same way addTrack did).
       for (const sender of entry.pc.getSenders()) {
-        if (sender.track === track) {
-          entry.pc.removeTrack(sender);
+        if (sender.track && sender.track.kind === 'audio') {
+          void sender.replaceTrack(null);
         }
       }
     }
-    track.stop();
+    // Don't stop the track — the mixer owns it and may re-publish it later.
   }, []);
 
   const publishVideo = useCallback(
