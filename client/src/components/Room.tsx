@@ -4,6 +4,7 @@ import { useRoom } from '../hooks/useRoom';
 import { useMesh, type MeshCallbacks } from '../hooks/useMesh';
 import { useVoice } from '../hooks/useVoice';
 import { useScreenShare } from '../hooks/useScreenShare';
+import { useAudioMixer } from '../hooks/useAudioMixer';
 import type { QualityPresetId } from '../lib/quality';
 import { VideoStage } from './VideoStage';
 import { ParticipantList } from './ParticipantList';
@@ -34,8 +35,42 @@ export function Room({ roomId, name, onLeave }: RoomProps) {
   }, [room.isHost, room.subscribed, room.hostId]);
 
   const mesh = useMesh(signaling, () => room.selfId, callbacksRef);
-  const voice = useVoice(mesh);
+  // The mixer is the single source of WebRTC audio: mic + screen audio are
+  // combined into ONE MediaStreamTrack before being handed to the mesh. This
+  // prevents the "two audio senders in one PeerConnection" bug that broke SDP
+  // renegotiation whenever the host streamed screen + mic at the same time.
+  const mixer = useAudioMixer();
+  // `useVoice` no longer takes `mesh` — it only captures the mic track. The
+  // mixer + the publish effect below do the WebRTC plumbing.
+  const voice = useVoice();
   const screen = useScreenShare(mesh, room, voice.getRemoteStream);
+
+  // Route the live mic track into the mixer. The disconnect fn from
+  // connectMicrophone is returned as the effect cleanup, so toggling the mic
+  // off detaches it from the bus automatically.
+  useEffect(() => {
+    if (!voice.localTrack) return;
+    return mixer.connectMicrophone(voice.localTrack);
+  }, [voice.localTrack, mixer]);
+
+  // Route the screen-share audio track (Electron WASAPI bridge OR browser
+  // getDisplayMedia audio) into the mixer. Same disconnect-on-cleanup pattern.
+  useEffect(() => {
+    if (!screen.audioTrackForMixer) return;
+    return mixer.connectScreenAudio(screen.audioTrackForMixer);
+  }, [screen.audioTrackForMixer, mixer]);
+
+  // Publish the single mixed track to the mesh. The mixedTrack reference is
+  // stable for the mixer's lifetime (sources connect/disconnect around it), so
+  // this effect fires ONCE per session unless the whole mixer is torn down —
+  // toggling mic or screen audio does not re-trigger renegotiation.
+  useEffect(() => {
+    if (!mixer.mixedTrack) return;
+    mesh.publishAudio(mixer.mixedTrack);
+    return () => {
+      mesh.unpublishAudio();
+    };
+  }, [mixer.mixedTrack, mesh]);
 
   // Route remote tracks to the appropriate sinks.
   useEffect(() => {
@@ -222,6 +257,11 @@ export function Room({ roomId, name, onLeave }: RoomProps) {
             audioViaFfmpeg={screen.audioViaFfmpeg}
             isElectron={screen.isElectron}
             selectedAudioLabel={screen.selectedAudioLabel}
+            showGainControls={!!mixer.mixedTrack && room.isHost}
+            voiceGain={mixer.voiceGain}
+            screenGain={mixer.screenGain}
+            onVoiceGainChange={mixer.setVoiceGain}
+            onScreenGainChange={mixer.setScreenGain}
           />
         </div>
 

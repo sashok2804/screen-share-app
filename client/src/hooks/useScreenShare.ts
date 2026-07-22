@@ -236,6 +236,14 @@ export interface UseScreenShareResult {
    * capture failed).
    */
   selectedAudioLabel: string | null;
+
+  /**
+   * The captured screen-share / system-audio track that the host component
+   * should route into the central `useAudioMixer` (so mic + screen audio end
+   * up in a single WebRTC track). `null` when no screen audio is being
+   * captured. The Room component subscribes to this via useEffect.
+   */
+  audioTrackForMixer: MediaStreamTrack | null;
 }
 
 /**
@@ -295,6 +303,14 @@ export function useScreenShare(
   const [selectedAudioLabel, setSelectedAudioLabel] = useState<string | null>(null);
 
   /**
+   * The screen-share audio track the host component should feed into
+   * `useAudioMixer`. Replaces the old `mesh.publishAudio(audioTrack)` call —
+   * the mixer is now the only thing that publishes audio, so we don't create
+   * a second audio sender and break SDP renegotiation.
+   */
+  const [audioTrackForMixer, setAudioTrackForMixer] = useState<MediaStreamTrack | null>(null);
+
+  /**
    * Auto-pick the audio source based on the chosen video source and start
    * WASAPI loopback capture. Called from `startStream` right after the video
    * track has been published. The pipeline is fire-and-forget: errors surface
@@ -324,7 +340,7 @@ export function useScreenShare(
         try {
           await processAudio.stop();
           if (audioViaFfmpeg) {
-            mesh.unpublishAudio();
+            setAudioTrackForMixer(null);
             if (audioTrackRef.current) {
               audioTrackRef.current.stop();
               audioTrackRef.current = null;
@@ -342,7 +358,10 @@ export function useScreenShare(
             return;
           }
           audioTrackRef.current = track;
-          mesh.publishAudio(track);
+          // Hand the track to the host component, which feeds it into the
+          // central audio mixer. We do NOT publish here — the mixer is the
+          // single source of audio to the mesh.
+          setAudioTrackForMixer(track);
           setAudioViaFfmpeg(true);
           setStream((s) => (s ? { ...s, hasAudio: true } : s));
           setSelectedAudioLabel(label);
@@ -354,7 +373,7 @@ export function useScreenShare(
         }
       })();
     },
-    [isElectron, processAudio, audioViaFfmpeg, mesh],
+    [isElectron, processAudio, audioViaFfmpeg],
   );
 
   // ---- Phase 2: Electron source picker -----------------------------------
@@ -452,11 +471,11 @@ export function useScreenShare(
     }
     if (audioTrackRef.current) {
       audioTrackRef.current.stop();
-      // When audio came from the loopback bridge we also have to ask the
-      // main process to tear down the WASAPI session + AudioContext.
-      if (audioViaFfmpeg) {
-        mesh.unpublishAudio();
-      }
+      // Drop the screen-audio input from the central mixer. The mixer (not us)
+      // owns the WebRTC audio sender, so we never call mesh.unpublishAudio()
+      // directly. Setting this to null causes the host component's useEffect
+      // to call the mixer's disconnect fn.
+      setAudioTrackForMixer(null);
       audioTrackRef.current = null;
     }
     if (audioViaFfmpeg) {
@@ -493,7 +512,10 @@ export function useScreenShare(
       const audioTrack = media.getAudioTracks()[0];
       if (audioTrack) {
         audioTrackRef.current = audioTrack;
-        mesh.publishAudio(audioTrack);
+        // Hand the track to the host component so it can feed the mixer. We do
+        // NOT call mesh.publishAudio here — that would create a second audio
+        // sender next to the mic's and break SDP renegotiation.
+        setAudioTrackForMixer(audioTrack);
       }
 
       streamRef.current = media;
@@ -650,6 +672,7 @@ export function useScreenShare(
     isElectron,
     audioViaFfmpeg,
     selectedAudioLabel,
+    audioTrackForMixer,
     // Phase 2
     sourcePickerOpen,
     confirmSource,

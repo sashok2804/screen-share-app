@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { UseMeshResult } from './useMesh';
 
 export interface UseVoiceResult {
   micEnabled: boolean;
@@ -34,12 +33,17 @@ export interface UseVoiceResult {
 }
 
 /**
- * Microphone capture + publish through the mesh.
+ * Microphone capture.
  *
- * Always sends audio (when enabled); there's no per-viewer subscription —
- * voice goes to everyone in the room.
+ * This hook only CAPTURES the microphone and exposes the resulting track via
+ * `localTrack`. It no longer publishes anything to the mesh directly — the
+ * Room component feeds the track into the central `useAudioMixer`, which
+ * combines it with screen-share audio into a single WebRTC track. That single
+ * track is what the mesh publishes. Publishing the mic separately caused two
+ * audio senders to land in the same RTCPeerConnection, breaking SDP
+ * renegotiation whenever the host had mic + screen audio both on.
  */
-export function useVoice(mesh: UseMeshResult): UseVoiceResult {
+export function useVoice(): UseVoiceResult {
   const [micEnabled, setMicEnabled] = useState(false);
   const [hasPermission, setHasPermission] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -79,7 +83,6 @@ export function useVoice(mesh: UseMeshResult): UseVoiceResult {
       if (!track) throw new Error('No audio track in getUserMedia result');
       trackRef.current = track;
       setLocalTrack(track);
-      mesh.publishAudio(track);
       setMicEnabled(true);
       setHasPermission(true);
       setError(null);
@@ -88,14 +91,13 @@ export function useVoice(mesh: UseMeshResult): UseVoiceResult {
       setError(message);
       setMicEnabled(false);
     }
-  }, [mesh]);
+  }, []);
 
   const stopMic = useCallback(() => {
-    mesh.unpublishAudio();
     trackRef.current = null;
     setLocalTrack(null);
     setMicEnabled(false);
-  }, [mesh]);
+  }, []);
 
   const toggleMic = useCallback(async () => {
     if (micEnabled) stopMic();

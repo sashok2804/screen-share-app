@@ -28,6 +28,17 @@ export interface StreamControlsProps {
    * (read-only — the user does not pick it manually any more).
    */
   selectedAudioLabel?: string | null;
+  /**
+   * Per-bus gain controls. Shown only when the host has any audio flowing into
+   * the mixer (i.e. mic or screen audio is on). The mixer is what combines the
+   * two sources into a single WebRTC track, so these sliders affect the gain
+   * of each bus before the mix.
+   */
+  showGainControls?: boolean;
+  voiceGain?: number;
+  screenGain?: number;
+  onVoiceGainChange?: (g: number) => void;
+  onScreenGainChange?: (g: number) => void;
 }
 
 export function StreamControls({
@@ -42,6 +53,11 @@ export function StreamControls({
   audioViaFfmpeg,
   isElectron,
   selectedAudioLabel,
+  showGainControls,
+  voiceGain = 1,
+  screenGain = 1,
+  onVoiceGainChange,
+  onScreenGainChange,
 }: StreamControlsProps) {
   if (!isHost) {
     return (
@@ -190,6 +206,52 @@ export function StreamControls({
             Остановить стрим
           </button>
         </>
+      )}
+
+      {showGainControls && (onVoiceGainChange || onScreenGainChange) && (
+        <div className="space-y-2 rounded-lg border border-slate-700/60 bg-slate-950/60 px-3 py-2.5">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+            Микшер громкости
+          </div>
+          <div className="space-y-2">
+            <div>
+              <label className="flex items-center justify-between text-xs text-slate-300">
+                <span>Микрофон</span>
+                <span className="text-[10px] text-slate-500">
+                  {Math.round(voiceGain * 100)}%
+                </span>
+              </label>
+              <input
+                type="range"
+                min={0}
+                max={2}
+                step={0.1}
+                value={voiceGain}
+                onChange={(e) => onVoiceGainChange?.(Number(e.target.value))}
+                className="w-full accent-indigo-500"
+                aria-label="Громкость микрофона"
+              />
+            </div>
+            <div>
+              <label className="flex items-center justify-between text-xs text-slate-300">
+                <span>Демонстрация</span>
+                <span className="text-[10px] text-slate-500">
+                  {Math.round(screenGain * 100)}%
+                </span>
+              </label>
+              <input
+                type="range"
+                min={0}
+                max={2}
+                step={0.1}
+                value={screenGain}
+                onChange={(e) => onScreenGainChange?.(Number(e.target.value))}
+                className="w-full accent-indigo-500"
+                aria-label="Громкость демонстрации"
+              />
+            </div>
+          </div>
+        </div>
       )}
 
       {errorMessage && (
