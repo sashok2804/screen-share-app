@@ -34,7 +34,7 @@ const { FFmpegAudioCapture } = require('./src/ffmpeg-bridge.cjs');
  * care about user config (e.g. the Help menu, IPC exports). The runtime path is
  * `loadConfig().url` / the URL passed to `createMainWindow(url)`.
  */
-const DEFAULT_URL = 'https://localhost:3000';
+const DEFAULT_URL = 'https://194.226.115.141:8443';
 const RESOLVED_URL = process.env.SCREENSHARE_URL || DEFAULT_URL;
 
 /**
