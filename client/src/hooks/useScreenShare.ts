@@ -9,7 +9,7 @@ import {
   type QualityPresetId,
 } from '../lib/quality';
 import { applyBitrate, applyCodecPreferences } from '../lib/rtc';
-import type { ElectronSource } from '../electron';
+import type { AudioSourceSelection, ElectronSource } from '../electron';
 
 export interface ActiveStream {
   preset: QualityPreset;
@@ -39,11 +39,11 @@ export interface UseScreenShareResult {
   aecEnabled: boolean;
   setAecEnabled: (next: boolean) => void;
 
-  // ---- Phase 3: FFmpeg audio --------------------------------------------
+  // ---- Phase 3 (rewritten): loopback audio ------------------------------
   /** True when we are running inside Electron (so the UI can show hints). */
   isElectron: boolean;
   /**
-   * True when system audio is being captured via the FFmpeg/WASAPI bridge
+   * True when audio is being captured via the loopback-capture WASAPI bridge
    * (Electron-only). When true the `hasAudio` flag on `stream` reflects that
    * audio, and the existing system-loopback AEC path should NOT activate.
    */
@@ -67,20 +67,26 @@ export interface UseScreenShareResult {
    */
   cancelSource: () => void;
 
-  // ---- Phase 3: Electron audio device picker ----------------------------
+  // ---- Phase 3: Electron audio source picker ----------------------------
   /**
-   * DirectShow audio device names available on this machine (Electron only).
-   * Empty in the browser build or before the initial `listAudioDevices()` call
-   * resolves.
+   * `true` while the audio-source picker (`<ProcessAudioPicker>`) is open.
+   * The host component should render it conditionally and wire
+   * `confirmAudioSource` / `cancelAudioSource`.
    */
-  audioDevices: string[];
+  audioPickerOpen: boolean;
+  /** Open the ProcessAudioPicker modal. */
+  openAudioPicker: () => void;
+  /** Resolve the picker with the user's choice and start capture. */
+  confirmAudioSource: (selection: AudioSourceSelection) => void;
+  /** Resolve the picker with a cancellation (no audio change). */
+  cancelAudioSource: () => void;
+  /** Stop capturing application audio (revert to video-only). */
+  stopProcessAudio: () => void;
   /**
-   * The device the user picked in the dropdown, or `null` for "auto" (let the
-   * hook pick a sensible default — see `pickDefaultAudioDevice`).
+   * Human-readable label of the active audio source (e.g. "Spotify" or
+   * "Системный звук"), or `null` when no audio source is selected.
    */
-  selectedAudioDevice: string | null;
-  /** Set or clear the user's audio device choice. `null` means "auto". */
-  setAudioDevice: (name: string | null) => void;
+  selectedAudioLabel: string | null;
 }
 
 /**
@@ -109,51 +115,108 @@ export function useScreenShare(
   // capture will replace the system-audio path. Unused in the web build.
   void getRemoteAudioStream;
 
-  // Phase 3 — Electron-only FFmpeg audio bridge. The browser build will
-  // resolve `start()` to null and `stop()` to a no-op thanks to the
+  // Phase 3 (rewritten) — Electron-only loopback audio bridge. The browser
+  // build resolves `start()` to null and `stop()` to a no-op thanks to the
   // `isElectron` gate inside the hook.
   const processAudio = useProcessAudio();
-  /** True iff we are publishing system audio captured via FFmpeg (Electron). */
+  /** True iff we are publishing audio captured via the WASAPI bridge (Electron). */
   const [audioViaFfmpeg, setAudioViaFfmpeg] = useState(false);
 
   // `true` when running inside the Electron desktop client. Computed once at
-  // the top so every Electron-gated branch (including the device-loading
-  // effect below) can read it without reordering declarations.
+  // the top so every Electron-gated branch can read it without reordering.
   const isElectron =
     typeof window !== 'undefined' && window.electronAPI?.isElectron === true;
 
-  // Phase 3 — list of DirectShow audio devices + the user's selection. The
-  // dropdown lets the host override our heuristic default picker. `null`
-  // means "auto" (the hook / useProcessAudio picks a loopback device).
-  const [audioDevices, setAudioDevices] = useState<string[]>([]);
-  const [selectedAudioDevice, setSelectedAudioDevice] = useState<string | null>(null);
-  useEffect(() => {
-    if (!isElectron || !window.electronAPI?.listAudioDevices) return;
-    let cancelled = false;
-    window.electronAPI
-      .listAudioDevices()
-      .then((res) => {
-        if (cancelled) return;
-        setAudioDevices(res?.audio ?? []);
-      })
-      .catch((err) => {
-        console.error('[screen-share] listAudioDevices failed:', err);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [isElectron]);
-
+  // Refs are declared up-front so every callback below (including the audio
+  // picker helpers, which touch audioTrackRef) can reference them safely.
   const streamRef = useRef<MediaStream | null>(null);
   const videoTrackRef = useRef<MediaStreamTrack | null>(null);
   const audioTrackRef = useRef<MediaStreamTrack | null>(null);
   const presetRef = useRef<QualityPreset | null>(null);
-
   const localPreviewRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteStreamRef = useRef<MediaStream>(new MediaStream());
   /** Holds the latest stopStream so the 'ended' handler can call it safely. */
   const stopRef = useRef<() => void>(() => {});
+
+  // Phase 3 (rewritten) — audio source selection. Unlike the old device-
+  // dropdown model, the host now picks an audio source via the
+  // `<ProcessAudioPicker>` modal AFTER starting video, on demand. `null` means
+  // "no audio source selected" (video-only stream).
+  const [audioPickerOpen, setAudioPickerOpen] = useState(false);
+  /** Human-readable label for the currently-active source (UI feedback). */
+  const [selectedAudioLabel, setSelectedAudioLabel] = useState<string | null>(null);
+
+  /**
+   * Resolve the picker with the user's choice AND start the loopback capture
+   * immediately. The async pipeline (stop any prior capture → start new →
+   * publish audio track → flag hasAudio) is fire-and-forget: errors surface
+   * through `error`/`processAudio.error` rather than rejecting a promise the
+   * UI isn't awaiting.
+   */
+  const confirmAudioSource = useCallback((selection: AudioSourceSelection) => {
+    setAudioPickerOpen(false);
+    void (async () => {
+      try {
+        // Tear down any prior loopback capture so the new selection replaces it.
+        await processAudio.stop();
+        if (audioViaFfmpeg) {
+          mesh.unpublishAudio();
+          if (audioTrackRef.current) {
+            audioTrackRef.current.stop();
+            audioTrackRef.current = null;
+          }
+          setAudioViaFfmpeg(false);
+        }
+
+        const track = await processAudio.start(selection);
+        if (!track) {
+          const msg = processAudio.error ?? 'Не удалось запустить захват звука';
+          setError(`Звук: ${msg}`);
+          setSelectedAudioLabel(null);
+          return;
+        }
+        audioTrackRef.current = track;
+        mesh.publishAudio(track);
+        setAudioViaFfmpeg(true);
+        setStream((s) => (s ? { ...s, hasAudio: true } : s));
+        setSelectedAudioLabel(
+          'pid' in selection ? selection.name : 'Системный звук',
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error('[screen-share] processAudio.start failed:', msg);
+        setError(`Звук: ${msg}`);
+        setSelectedAudioLabel(null);
+      }
+    })();
+  }, [processAudio, audioViaFfmpeg, mesh]);
+
+  const cancelAudioSource = useCallback(() => {
+    setAudioPickerOpen(false);
+  }, []);
+
+  const openAudioPicker = useCallback(() => {
+    setAudioPickerOpen(true);
+  }, []);
+
+  /** Stop the loopback capture (revert to video-only). */
+  const stopProcessAudio = useCallback(() => {
+    void (async () => {
+      try {
+        await processAudio.stop();
+      } catch (err) {
+        console.error('[screen-share] stopProcessAudio failed', err);
+      }
+      if (audioViaFfmpeg) {
+        mesh.unpublishAudio();
+        audioTrackRef.current = null;
+        setAudioViaFfmpeg(false);
+        setStream((s) => (s ? { ...s, hasAudio: false } : s));
+      }
+      setSelectedAudioLabel(null);
+    })();
+  }, [processAudio, audioViaFfmpeg, mesh]);
 
   // ---- Phase 2: Electron source picker -----------------------------------
   //
@@ -237,10 +300,14 @@ export function useScreenShare(
   );
 
   const stopStream = useCallback(() => {
-    // Safety net: if the user clicks stop while the picker is open, cancel
-    // the pending promise so startStream() doesn't hang waiting on a resolver.
+    // Safety net: if the user clicks stop while the source picker is open,
+    // cancel the pending promise so an awaiting startStream() doesn't hang on
+    // a resolver that will never fire. Also dismiss the audio picker.
     if (pendingSourceRef.current) {
       cancelSource();
+    }
+    if (audioPickerOpen) {
+      setAudioPickerOpen(false);
     }
     if (videoTrackRef.current) {
       videoTrackRef.current.stop();
@@ -249,8 +316,8 @@ export function useScreenShare(
     }
     if (audioTrackRef.current) {
       audioTrackRef.current.stop();
-      // When audio came from the FFmpeg bridge we also have to ask the
-      // main process to tear down the subprocess + AudioContext.
+      // When audio came from the loopback bridge we also have to ask the
+      // main process to tear down the WASAPI session + AudioContext.
       if (audioViaFfmpeg) {
         mesh.unpublishAudio();
       }
@@ -260,13 +327,14 @@ export function useScreenShare(
       void processAudio.stop();
       setAudioViaFfmpeg(false);
     }
+    setSelectedAudioLabel(null);
     streamRef.current = null;
     presetRef.current = null;
     if (localPreviewRef.current) localPreviewRef.current.srcObject = null;
     setIsStreaming(false);
     setStream(null);
     room.notifyStreamStop();
-  }, [mesh, room, cancelSource, processAudio, audioViaFfmpeg]);
+  }, [mesh, room, cancelSource, processAudio, audioViaFfmpeg, audioPickerOpen]);
 
   /**
    * Shared post-capture pipeline for both Electron and browser paths:
@@ -333,9 +401,14 @@ export function useScreenShare(
           }
           // Electron's desktop-capture constraint shape is non-standard; the
           // `mandatory` wrapper is required by Chromium's desktop capturer.
+          // Audio is intentionally `false` here: on Electron it would hit the
+          // same system-loopback echo loop we're avoiding. Application audio
+          // is captured separately (echo-free) via the loopback-capture WASAPI
+          // bridge, which the host selects on demand from StreamControls →
+          // ProcessAudioPicker (see confirmAudioSource).
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const media = (await navigator.mediaDevices.getUserMedia({
-            audio: false, // Phase 3 will add process audio via the FFmpeg bridge.
+            audio: false,
             video: {
               mandatory: {
                 chromeMediaSource: 'desktop',
@@ -350,32 +423,6 @@ export function useScreenShare(
           } as any)) as MediaStream;
 
           publishCapturedMedia(media, preset, presetId);
-
-          // Phase 3 — Electron: kick off FFmpeg-based system-audio capture.
-          // Failure is non-fatal: video still flows, peers just won't hear
-          // audio. Surface the error via the existing `error` channel.
-          void (async () => {
-            try {
-              // `selectedAudioDevice` is null → "auto" → useProcessAudio picks
-              // a sensible loopback default (Voicemeeter / CABLE / Stereo Mix).
-              const track = await processAudio.start(
-                selectedAudioDevice ?? undefined,
-              );
-              if (track) {
-                audioTrackRef.current = track;
-                mesh.publishAudio(track);
-                setAudioViaFfmpeg(true);
-                setStream((s) => (s ? { ...s, hasAudio: true } : s));
-              } else if (processAudio.error) {
-                setError(`FFmpeg audio: ${processAudio.error}`);
-              }
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              console.error('[screen-share] processAudio.start failed:', msg);
-              setError(`FFmpeg audio: ${msg}`);
-            }
-          })();
-
           return;
         }
 
@@ -401,7 +448,7 @@ export function useScreenShare(
         }
       }
     },
-    [isElectron, mesh, room, configureVideoSenders, requestSourceFromPicker, publishCapturedMedia, processAudio, selectedAudioDevice],
+    [isElectron, mesh, room, configureVideoSenders, requestSourceFromPicker, publishCapturedMedia],
   );
 
   // Keep the ref pointing at the latest stopStream (so the track's 'ended'
@@ -459,12 +506,15 @@ export function useScreenShare(
     detachRemoteVideo,
     aecEnabled: false,
     setAecEnabled: () => {},
-    // Phase 3
+    // Phase 3 (rewritten)
     isElectron,
     audioViaFfmpeg,
-    audioDevices,
-    selectedAudioDevice,
-    setAudioDevice: setSelectedAudioDevice,
+    audioPickerOpen,
+    openAudioPicker,
+    confirmAudioSource,
+    cancelAudioSource,
+    stopProcessAudio,
+    selectedAudioLabel,
     // Phase 2
     sourcePickerOpen,
     confirmSource,

@@ -15,13 +15,16 @@
  *     source. The main process caches the last list so this call is cheap and
  *     does not re-query the OS.
  *
- * Phase 3 adds the FFmpeg WASAPI / DirectShow bridge:
- *   - listAudioDevices(): returns `{ audio: string[], video: string[], ffmpegFound: boolean }`.
- *   - startProcessAudio({ deviceName?, sampleRate?, channels? }): starts the
- *     subprocess and returns `{ ok, sampleRate, channels }` or `{ ok:false, error }`.
- *   - stopProcessAudio(): tears down the subprocess.
- *   - onAudioChunk(cb): subscribes to `audio:chunk` events (Float32Array payload).
- *     Returns an unsubscribe function.
+ * Phase 3 (rewritten) adds the per-process WASAPI loopback bridge
+ * (`loopback-capture` npm package — Discord-style, no echo):
+ *   - listAudioProcesses(): returns `{ pid, name, title }[]` of processes with a
+ *     visible window, for the audio-source picker.
+ *   - startProcessAudio({ pid } | { system }): starts WASAPI capture (per-process
+ *     loopback, or whole-default-endpoint loopback). Returns
+ *     `{ ok, sampleRate, channels }` or `{ ok:false, error }`.
+ *   - stopProcessAudio(): tears down the capture session.
+ *   - onAudioChunk(cb): subscribes to `audio:chunk` events (Float32Array, mono,
+ *     48 kHz). Returns an unsubscribe function.
  *   - onAudioError(cb): optional diagnostic subscription for hard failures
  *     that arrive mid-capture (after start() has already resolved).
  */
@@ -84,30 +87,30 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return await ipcRenderer.invoke('desktop-capturer:getSourceMetadata', sourceId);
   },
 
-  // ---- Phase 3: FFmpeg WASAPI / DirectShow bridge ------------------------
+  // ---- Phase 3 (rewritten): loopback-capture WASAPI bridge ----------------
 
   /**
-   * List available DirectShow audio + video input devices via FFmpeg.
-   * Returns an empty list (with `ffmpegFound:false`) when no FFmpeg is
-   * available — the renderer should treat that as "audio capture disabled".
+   * List running processes that own a visible window, so the renderer can show
+   * an application picker for audio capture. Returns `{ pid, name, title }[]`.
+   * Empty on non-Windows or on PowerShell failure.
    *
-   * @returns {Promise<{ audio: string[], video: string[], ffmpegFound: boolean }>}
+   * @returns {Promise<Array<{ pid: number, name: string, title: string }>>}
    */
-  listAudioDevices: async () => {
-    const result = await ipcRenderer.invoke('audio:listDevices');
-    return {
-      audio: Array.isArray(result?.audio) ? result.audio : [],
-      video: Array.isArray(result?.video) ? result.video : [],
-      ffmpegFound: result?.ffmpegFound !== false,
-    };
+  listAudioProcesses: async () => {
+    const result = await ipcRenderer.invoke('audio:listProcesses');
+    return Array.isArray(result) ? result : [];
   },
 
   /**
-   * Start capturing raw f32le PCM from the named device. If `deviceName` is
-   * omitted/empty, FFmpeg opens its default input. Resolves once the first
-   * audio data has arrived.
+   * Start WASAPI loopback capture. Pass exactly one of:
+   *   - `{ system: true }` — capture the whole default render endpoint
+   *     (everything playing through the default speakers/headphones).
+   *   - `{ pid: <number> }` — capture only the chosen process (and its child
+   *     tree) via WASAPI process loopback. This is the echo-free path: the
+   *     remote peer's voice emitted by our Electron window is NOT included
+   *     because it belongs to a different process.
    *
-   * @param {{ deviceName?: string, sampleRate?: number, channels?: number, format?: 'dshow'|'wasapi' }} [opts]
+   * @param {{ pid?: number, system?: boolean }} [opts]
    * @returns {Promise<{ ok: true, sampleRate: number, channels: number } | { ok: false, error: string }>}
    */
   startProcessAudio: async (opts) => {
@@ -123,8 +126,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   /**
-   * Subscribe to raw audio chunks (Float32Array) emitted by the FFmpeg
-   * subprocess. Returns an unsubscribe function.
+   * Subscribe to mono Float32 audio chunks (48 kHz) emitted by the loopback
+   * capture. Returns an unsubscribe function.
    *
    * @param {(chunk: Float32Array) => void} callback
    * @returns {() => void}
@@ -144,8 +147,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   /**
-   * Subscribe to mid-capture hard errors (e.g. FFmpeg crashed after start).
-   * Returns an unsubscribe function.
+   * Subscribe to mid-capture hard errors. Returns an unsubscribe function.
    *
    * @param {(err: { message: string }) => void} callback
    * @returns {() => void}

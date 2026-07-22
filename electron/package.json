@@ -3,16 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "author": "sashok2804",
-  "description": "Electron desktop client for the screen-share-app (Windows). Loads the React client over HTTPS and adds process-loopback audio capture via FFmpeg.",
+  "description": "Electron desktop client for the screen-share-app (Windows). Loads the React client over HTTPS and adds per-process WASAPI loopback audio capture (Discord-style, no echo).",
   "type": "commonjs",
   "main": "main.cjs",
   "scripts": {
     "dev": "electron .",
-    "download-ffmpeg": "node scripts/download-ffmpeg.cjs",
     "build": "electron-builder --win nsis",
     "clean": "rimraf dist out"
   },
-  "dependencies": {},
+  "dependencies": {
+    "loopback-capture": "^2.0.0"
+  },
   "devDependencies": {
     "electron": "33.4.11",
     "electron-builder": "^26.0.0",
@@ -29,13 +30,13 @@
       "**/*",
       "!**/*.map",
       "!dist/**",
-      "!out/**"
+      "!out/**",
+      "!bin/**",
+      "!scripts/**"
     ],
-    "extraResources": [
-      {
-        "from": "bin/ffmpeg.exe",
-        "to": "ffmpeg.exe"
-      }
+    "extraResources": [],
+    "asarUnpack": [
+      "**/node_modules/loopback-capture/**"
     ],
     "win": {
       "target": [

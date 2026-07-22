@@ -15,18 +15,18 @@ export interface StreamControlsProps {
   /** Toggle AEC. */
   onToggleAec?: (next: boolean) => void;
   /**
-   * Phase 3 — `true` when system audio is captured via the Electron FFmpeg /
-   * WASAPI bridge (no browser fallback path, no echo loop).
+   * Phase 3 (rewritten) — `true` when audio is captured via the loopback-capture
+   * WASAPI bridge (per-process or system-wide; Electron-only, no echo).
    */
   audioViaFfmpeg?: boolean;
   /** Phase 3 — running inside the Electron desktop client. */
   isElectron?: boolean;
-  /** Phase 3 — DirectShow audio device names for the dropdown. */
-  audioDevices?: string[];
-  /** Phase 3 — the user's selection, or null for "auto". */
-  selectedAudioDevice?: string | null;
-  /** Phase 3 — change the selection. `null` restores "auto". */
-  onPickAudioDevice?: (name: string | null) => void;
+  /** Phase 3 — open the ProcessAudioPicker modal. */
+  onOpenAudioPicker?: () => void;
+  /** Phase 3 — stop the loopback capture (revert to video-only). */
+  onStopProcessAudio?: () => void;
+  /** Phase 3 — human-readable label of the active audio source, or null. */
+  selectedAudioLabel?: string | null;
 }
 
 export function StreamControls({
@@ -41,9 +41,9 @@ export function StreamControls({
   aecEnabled,
   audioViaFfmpeg,
   isElectron,
-  audioDevices,
-  selectedAudioDevice,
-  onPickAudioDevice,
+  onOpenAudioPicker,
+  onStopProcessAudio,
+  selectedAudioLabel,
 }: StreamControlsProps) {
   if (!isHost) {
     return (
@@ -70,31 +70,44 @@ export function StreamControls({
         </span>
       </div>
 
-      {isElectron && audioDevices && audioDevices.length > 0 && onPickAudioDevice && (
-        <div className="space-y-1">
-          <label
-            htmlFor="audio-device-select"
-            className="block text-[11px] font-medium text-slate-400"
-          >
-            Источник звука (системный аудио через FFmpeg)
+      {/* Phase 3 (rewritten): application audio source picker (Electron only). */}
+      {isElectron && hostStreaming && (
+        <div className="space-y-1.5">
+          <label className="block text-[11px] font-medium text-slate-400">
+            Источник звука (WASAPI loopback, без эха)
           </label>
-          <select
-            id="audio-device-select"
-            value={selectedAudioDevice ?? ''}
-            onChange={(e) => onPickAudioDevice(e.target.value || null)}
-            className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-500"
-          >
-            <option value="">Авто (Voicemeeter / CABLE)</option>
-            {audioDevices.map((d) => (
-              <option key={d} value={d}>
-                {d}
-              </option>
-            ))}
-          </select>
-          {hostStreaming && (
-            <p className="text-[10px] text-slate-500">
-              Изменения вступят в силу при следующем запуске стрима.
-            </p>
+          {audioViaFfmpeg ? (
+            <div className="flex items-center gap-2">
+              <div className="flex-1 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200">
+                <span className="font-medium">🔊 {selectedAudioLabel ?? 'Звук приложения'}</span>
+                <span className="ml-2 text-[10px] text-emerald-300/70">захватывается без эха</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => onOpenAudioPicker?.()}
+                className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-200 transition hover:border-slate-600"
+              >
+                Сменить
+              </button>
+              <button
+                type="button"
+                onClick={() => onStopProcessAudio?.()}
+                className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-200 transition hover:bg-rose-500/20"
+              >
+                Без звука
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onOpenAudioPicker?.()}
+              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-left text-sm text-slate-300 transition hover:border-indigo-500 hover:text-slate-100"
+            >
+              <span className="font-medium">Выбрать аудио-источник…</span>
+              <span className="ml-2 text-[10px] text-slate-500">
+                приложение или системный звук
+              </span>
+            </button>
           )}
         </div>
       )}
@@ -147,7 +160,7 @@ export function StreamControls({
               <Stat label="Частота кадров" value={`${Math.round(effective.frameRate)} fps`} />
               <Stat
                 label="Звук источника"
-                value={effective.hasAudio ? '✓ есть' : '✕ нет (Window-источник)'}
+                value={effective.hasAudio ? '✓ есть' : '✕ нет (выберите источник)'}
               />
               <Stat label="Активный пресет" value={activePreset ?? '—'} />
             </div>
@@ -155,10 +168,12 @@ export function StreamControls({
 
           {effective?.hasAudio && audioViaFfmpeg && (
             <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-300/90">
-              <div className="font-medium">Звук через FFmpeg (WASAPI)</div>
+              <div className="font-medium">
+                Звук через WASAPI loopback{selectedAudioLabel ? ` — ${selectedAudioLabel}` : ''}
+              </div>
               <div className="mt-0.5 text-[10px] text-emerald-300/70">
-                Системный звук захватывается напрямую через FFmpeg без эха, без
-                loopback-петли, как в браузере.
+                Захват выбранного приложения без эха: голос друга из этого окна
+                исключается автоматически (как в Discord).
               </div>
             </div>
           )}

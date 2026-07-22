@@ -10,6 +10,7 @@ import { ParticipantList } from './ParticipantList';
 import { StreamControls } from './StreamControls';
 import { SubscribeButton } from './SubscribeButton';
 import { SourcePicker } from './SourcePicker';
+import { ProcessAudioPicker } from './ProcessAudioPicker';
 
 export interface RoomProps {
   roomId: string;
@@ -223,9 +224,9 @@ export function Room({ roomId, name, onLeave }: RoomProps) {
             onToggleAec={screen.setAecEnabled}
             audioViaFfmpeg={screen.audioViaFfmpeg}
             isElectron={screen.isElectron}
-            audioDevices={screen.audioDevices}
-            selectedAudioDevice={screen.selectedAudioDevice}
-            onPickAudioDevice={screen.setAudioDevice}
+            onOpenAudioPicker={screen.openAudioPicker}
+            onStopProcessAudio={screen.stopProcessAudio}
+            selectedAudioLabel={screen.selectedAudioLabel}
           />
         </div>
 
@@ -263,6 +264,14 @@ export function Room({ roomId, name, onLeave }: RoomProps) {
         <SourcePicker
           onPick={(s) => screen.confirmSource(s)}
           onCancel={() => screen.cancelSource()}
+        />
+      )}
+
+      {/* Electron-only application-audio source picker (WASAPI loopback, no echo). */}
+      {screen.audioPickerOpen && (
+        <ProcessAudioPicker
+          onPick={(selection) => screen.confirmAudioSource(selection)}
+          onCancel={() => screen.cancelAudioSource()}
         />
       )}
 

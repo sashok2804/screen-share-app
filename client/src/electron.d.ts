@@ -2,7 +2,9 @@
  * Ambient types for the `window.electronAPI` surface exposed by the Electron
  * preload script (see `electron/preload.cjs`).
  *
- * Phases 1, 2 and 3 are all implemented (source picker + FFmpeg audio bridge).
+ * Phase 1 (protocol + version), Phase 2 (source picker) and Phase 3 (per-
+ * process WASAPI loopback audio via the `loopback-capture` npm package) are
+ * implemented.
  */
 
 export {};
@@ -23,7 +25,9 @@ export interface ElectronSource {
 /** Result of `startProcessAudio` on success. */
 export interface ProcessAudioStartOk {
   ok: true;
+  /** Output sample rate delivered to the renderer (always 48000). */
   sampleRate: number;
+  /** Output channel count delivered to the renderer (always 1, mono). */
   channels: number;
 }
 /** Result of `startProcessAudio` on failure. */
@@ -33,25 +37,37 @@ export interface ProcessAudioStartErr {
 }
 export type ProcessAudioStartResult = ProcessAudioStartOk | ProcessAudioStartErr;
 
-/** Options accepted by `startProcessAudio`. */
+/**
+ * Options accepted by `startProcessAudio`. Exactly one of `pid` / `system`
+ * must be provided:
+ *   - `{ pid }`     — per-process WASAPI loopback (Discord-style, echo-free).
+ *   - `{ system }`  — whole default render endpoint (entire desktop audio).
+ */
 export interface StartProcessAudioOptions {
-  /** DShow/WASAPI device name; empty = FFmpeg default input. */
-  deviceName?: string;
-  /** Output sample rate. Default 48000. */
-  sampleRate?: number;
-  /** Output channel count. Default 2. */
-  channels?: number;
-  /** Input format. Default 'dshow'. */
-  format?: 'dshow' | 'wasapi';
+  /**
+   * Target process id. Captures the process and (on the main-process side) its
+   * child tree via `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`.
+   */
+  pid?: number;
+  /**
+   * When `true`, capture the entire default playback device (everything
+   * playing through speakers/headphones) using classic WASAPI loopback.
+   */
+  system?: boolean;
 }
 
-/** Result of `listAudioDevices`. */
-export interface ListAudioDevicesResult {
-  audio: string[];
-  video: string[];
-  /** `false` if FFmpeg was not found on the system. */
-  ffmpegFound: boolean;
+/** A running process with a visible window — used by the audio source picker. */
+export interface AudioProcess {
+  /** OS process id. */
+  pid: number;
+  /** Process executable name without extension (e.g. "firefox", "Spotify"). */
+  name: string;
+  /** Main window title (e.g. "Discord", "Menu — Spotify"). */
+  title: string;
 }
+
+/** Selection made in the `ProcessAudioPicker`: either a process or system. */
+export type AudioSourceSelection = { pid: number; name: string } | { system: true };
 
 declare global {
   interface Window {
@@ -75,19 +91,25 @@ declare global {
       /** Returns `{ name }` for a previously-listed source, or null. */
       getSourceMetadata?: (sourceId: string) => Promise<{ name: string } | null>;
 
-      // ---- Phase 3: FFmpeg WASAPI bridge ----------------------------------
-      /** Lists DirectShow audio/video devices. */
-      listAudioDevices?: () => Promise<ListAudioDevicesResult>;
+      // ---- Phase 3 (rewritten): loopback-capture WASAPI bridge ------------
+      /**
+       * List running processes with a visible window (for the audio picker).
+       * Returns `[]` on non-Windows or on PowerShell failure.
+       */
+      listAudioProcesses?: () => Promise<AudioProcess[]>;
 
-      /** Start FFmpeg audio capture from the named (or default) device. */
+      /**
+       * Start WASAPI loopback capture. Pass `{ pid }` for per-process capture
+       * (echo-free) or `{ system: true }` for the whole default render endpoint.
+       */
       startProcessAudio?: (
-        opts?: StartProcessAudioOptions
+        opts?: StartProcessAudioOptions,
       ) => Promise<ProcessAudioStartResult>;
 
       /** Stop the active capture. */
       stopProcessAudio?: () => Promise<{ ok: boolean }>;
 
-      /** Subscribe to audio chunks (Float32Array). Returns an unsubscribe. */
+      /** Subscribe to mono Float32 chunks (48 kHz). Returns an unsubscribe. */
       onAudioChunk?: (callback: (chunk: Float32Array) => void) => () => void;
 
       /** Subscribe to mid-capture hard errors. Returns an unsubscribe. */

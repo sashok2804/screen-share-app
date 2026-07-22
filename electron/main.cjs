@@ -12,7 +12,18 @@
  * Phase 2 adds: desktopCapturer source picker IPC handlers (`desktop-capturer:getSources`
  *               and `desktop-capturer:getSourceMetadata`) that back the renderer's custom
  *               source-picker UI instead of the native getDisplayMedia dialog.
- * Phase 3 will add: FFmpeg subprocess for WASAPI loopback capture.
+ * Phase 3 (rewritten): per-process WASAPI loopback audio capture via the
+ *               `loopback-capture` npm package. This replaces the earlier FFmpeg +
+ *               DirectShow approach: instead of grabbing the system mixer (which
+ *               includes the remote peer's voice coming out of our speakers →
+ *               echo), we capture only the chosen process's output via
+ *               `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` (the same trick
+ *               Discord uses). `startSystemAudio` falls back to classic WASAPI
+ *               loopback on the default render endpoint when the user wants the
+ *               whole desktop. Raw PCM (16-bit signed LE, stereo, 48 kHz) is
+ *               averaged to mono Float32 in the main process and forwarded to
+ *               the renderer, where a ScriptProcessorNode feeds it into a
+ *               MediaStreamAudioDestinationNode → WebRTC.
  */
 
 'use strict';
@@ -20,11 +31,23 @@
 const { app, BrowserWindow, session, Menu, shell, ipcMain, desktopCapturer } = require('electron');
 
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { execSync } = require('child_process');
 const fs = require('fs');
 
-const { listDirectShowAudioDevices } = require('./src/dshow-devices.cjs');
-const { FFmpegAudioCapture } = require('./src/ffmpeg-bridge.cjs');
+/**
+ * `loopback-capture` ships a prebuilt N-API v9 binary (no Visual Studio build
+ * tools required) and only exposes `LoopbackCapture` with `start(pid, tree, cb)`,
+ * `startSystemAudio(cb)` and `stop()`. On non-Windows platforms the require()
+ * succeeds but the constructor logs a warning — we gate all calls behind
+ * `process.platform === 'win32'` below.
+ */
+let loopback = null;
+try {
+  loopback = require('loopback-capture');
+} catch (err) {
+  // eslint-disable-next-line no-console
+  console.error('[audio] failed to load loopback-capture:', err && err.message ? err.message : err);
+}
 
 /**
  * Default URL of the React client. In dev this is the Vite dev server proxied through
@@ -899,108 +922,95 @@ ipcMain.handle(
 );
 
 // ---------------------------------------------------------------------------
-// Phase 3 — FFmpeg WASAPI / DirectShow loopback audio bridge.
+// Phase 3 (rewritten) — per-process WASAPI loopback via `loopback-capture`.
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the path to the ffmpeg executable, checking (in order):
- *   1. `SCREENSHARE_FFMPEG` env var (full path).
- *   2. Bundled binary: `<resourcesPath>/ffmpeg.exe` if packaged, or
- *      `<electronDir>/bin/ffmpeg.exe` in dev.
- *   3. System PATH via `where ffmpeg` (Windows) / `which ffmpeg` (other).
+ * Convert a raw PCM chunk (16-bit signed LE, stereo, 48 kHz) from the native
+ * addon into a mono Float32Array for the renderer's Web Audio graph. Stereo
+ * frames are averaged to mono and each sample is normalised to [-1, 1] by
+ * dividing by 32768. The resulting buffer is structured-cloneable so it can
+ * cross the contextBridge intact.
  *
- * Returns the resolved absolute path, or `null` if no ffmpeg is available.
- * The result is cached so we don't spawn `where` on every IPC call.
- *
- * @returns {string | null}
+ * @param {Buffer} chunk  Raw PCM from `loopback-capture`.
+ * @returns {Float32Array}  Mono Float32 samples.
  */
-let cachedFFmpegPath = undefined; // undefined = not-yet-resolved
-function getFFmpegPath() {
-  if (cachedFFmpegPath !== undefined) return cachedFFmpegPath;
-
-  /** @type {string | null} */
-  let resolved = null;
-
-  // (1) Env var override.
-  const envPath = process.env.SCREENSHARE_FFMPEG;
-  if (envPath && fs.existsSync(envPath)) {
-    resolved = path.resolve(envPath);
+function pcmStereoS16ToMonoF32(chunk) {
+  // Each stereo frame is 4 bytes (2 channels × 2 bytes / int16).
+  const samples = chunk.length >> 2; // floor(len/4)
+  const out = new Float32Array(samples);
+  for (let i = 0; i < samples; i++) {
+    const left = chunk.readInt16LE(i * 4);
+    const right = chunk.readInt16LE(i * 4 + 2);
+    out[i] = (left + right) * (1 / 65536); // (L+R)/2 / 32768 == (L+R)/65536
   }
-
-  // (2) Bundled binary.
-  if (!resolved) {
-    try {
-      const bundled = app.isPackaged
-        ? path.join(process.resourcesPath, 'ffmpeg.exe')
-        : path.join(__dirname, 'bin', 'ffmpeg.exe');
-      if (fs.existsSync(bundled)) resolved = bundled;
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn('[ffmpeg] bundle path check failed:', err);
-    }
-  }
-
-  // (3) System PATH as last resort.
-  if (!resolved) {
-    try {
-      const finder = process.platform === 'win32' ? 'where' : 'which';
-      const result = spawnSync(finder, ['ffmpeg'], { windowsHide: true });
-      if (result.status === 0) {
-        const lines = (result.stdout?.toString('utf8') || '')
-          .split(/\r?\n/)
-          .map((l) => l.trim())
-          .filter(Boolean);
-        if (lines.length > 0 && fs.existsSync(lines[0])) {
-          resolved = lines[0];
-        }
-      }
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn('[ffmpeg] PATH lookup failed:', err);
-    }
-  }
-
-  if (resolved) {
-    // eslint-disable-next-line no-console
-    console.log(`[ffmpeg] resolved path: ${resolved}`);
-  } else {
-    // eslint-disable-next-line no-console
-    console.warn(
-      '[ffmpeg] no ffmpeg.exe found (set SCREENSHARE_FFMPEG, bundle bin/ffmpeg.exe, or install system-wide). Audio capture will be unavailable.',
-    );
-  }
-
-  cachedFFmpegPath = resolved;
-  return resolved;
+  return out;
 }
 
 /**
- * Currently active FFmpegAudioCapture instance (one at a time per window).
- * @type {FFmpegAudioCapture | null}
+ * Currently active `LoopbackCapture` instance. Only one capture runs at a time
+ * per window; starting a new one stops the previous.
+ * @type {{ stop: () => void } | null}
  */
 let currentCapture = null;
 
 /**
- * IPC: list available DShow audio devices. Always returns a stable shape;
- * `{ audio: string[], video: string[], raw: string, ffmpegFound: boolean }`.
+ * IPC: list running processes that own a visible window. Used by the renderer's
+ * `ProcessAudioPicker` to let the host choose which application's audio to
+ * capture (Discord-style). Returns `{ pid, name, title }[]`, always a stable
+ * array — empty on non-Windows or on PowerShell failure.
+ *
+ * Implementation note: Electron's `desktopCapturer.getSources()` does NOT
+ * expose the PID behind a window source, so we can't simply join on it. We
+ * query `Get-Process` directly — it's fast (<100 ms typical), no external
+ * deps, and matches the Windows-only nature of this feature.
+ *
+ * @returns {Promise<Array<{ pid: number, name: string, title: string }>>}
  */
-ipcMain.handle('audio:listDevices', async () => {
-  const ffmpegPath = getFFmpegPath();
-  if (!ffmpegPath) {
-    return { audio: [], video: [], raw: '', ffmpegFound: false };
-  }
+ipcMain.handle('audio:listProcesses', async () => {
+  if (process.platform !== 'win32') return [];
   try {
-    const result = await listDirectShowAudioDevices({ ffmpegPath });
-    return { ...result, ffmpegFound: true };
+    // ConvertTo-Json returns a single object (not an array) when only one
+    // process matches — normalise to an array in JS.
+    const output = execSync(
+      'powershell -NoProfile -NonInteractive -Command ' +
+        '"Get-Process | Where-Object { $_.MainWindowTitle -ne [string]::Empty } | ' +
+        'Select-Object Id,ProcessName,MainWindowTitle | ConvertTo-Json -Compress"',
+      { encoding: 'utf8', windowsHide: true, timeout: 8000 },
+    );
+    if (!output || !output.trim()) return [];
+    let list = JSON.parse(output);
+    if (!Array.isArray(list)) list = [list];
+    return list
+      .filter(
+        (p) =>
+          p && typeof p.Id === 'number' && typeof p.ProcessName === 'string' && typeof p.MainWindowTitle === 'string',
+      )
+      .map((p) => ({ pid: p.Id, name: p.ProcessName, title: p.MainWindowTitle }))
+      .filter((p) => p.title.length > 0 && p.name.length > 0)
+      // Sort by name for a stable, scannable list in the picker.
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.error('[main] audio:listDevices failed:', err);
-    return { audio: [], video: [], raw: '', ffmpegFound: true };
+    console.error('[audio:listProcesses] failed:', err && err.message ? err.message : err);
+    return [];
   }
 });
 
 /**
- * IPC: start capturing system audio from the named device.
+ * IPC: start WASAPI loopback capture. `opts` is one of:
+ *   - `{ system: true }`         capture the entire default render endpoint
+ *                                 (classic WASAPI loopback — everything playing).
+ *   - `{ pid: <number> }`        capture only the chosen process (and, by
+ *                                 default, its child tree) via process loopback.
+ *                                 This is the echo-free path: the remote peer's
+ *                                 voice coming out of our speakers is owned by
+ *                                 the Electron renderer process, NOT the target
+ *                                 process, so it is excluded automatically.
+ *
+ * Resolves to `{ ok, sampleRate, channels }` on success. Chunks are pushed to
+ * the renderer as `audio:chunk` events (Float32Array, mono, 48 kHz). Mid-
+ * capture failures are surfaced via `audio:error`.
  *
  * @param {unknown} _event
  * @param {unknown} rawOpts
@@ -1018,80 +1028,83 @@ ipcMain.handle('audio:start', async (_event, rawOpts) => {
       currentCapture = null;
     }
 
-    const ffmpegPath = getFFmpegPath();
-    if (!ffmpegPath) {
-      return { ok: false, error: 'ffmpeg not found' };
+    if (!loopback) {
+      return { ok: false, error: 'loopback-capture native module failed to load' };
     }
     if (process.platform !== 'win32') {
       return { ok: false, error: 'audio capture is Windows-only' };
     }
-
     if (!mainWindow || mainWindow.isDestroyed()) {
       return { ok: false, error: 'main window not available' };
     }
 
-    /** @type {{ deviceName?: string, sampleRate?: number, channels?: number, format?: 'dshow'|'wasapi' }} */
+    /** @type {{ pid?: unknown, system?: unknown }} */
     const opts =
-      rawOpts && typeof rawOpts === 'object'
-        ? /** @type {any} */ (rawOpts)
-        : {};
+      rawOpts && typeof rawOpts === 'object' ? /** @type {any} */ (rawOpts) : {};
+    const wantSystem = opts.system === true;
+    const pid = typeof opts.pid === 'number' ? opts.pid : null;
 
-    const deviceName = typeof opts.deviceName === 'string' ? opts.deviceName : '';
-    const sampleRate = Math.floor(opts.sampleRate || 48000);
-    const channels = Math.floor(opts.channels || 2);
-    const format = opts.format === 'wasapi' ? 'wasapi' : 'dshow';
+    if (!wantSystem && pid === null) {
+      return { ok: false, error: 'Either opts.pid or opts.system must be provided' };
+    }
 
-    const capture = new FFmpegAudioCapture({
-      ffmpegPath,
-      deviceName,
-      sampleRate,
-      channels,
-      format,
-      tryWasapiFallback: true,
-    });
+    const capture = new loopback.LoopbackCapture();
 
-    // Forward chunks to the renderer. Float32Array is structured-cloneable so
-    // we can ship it directly. If the window is destroyed mid-capture we just
-    // stop forwarding.
-    capture.on('chunk', (/** @type {Float32Array} */ chunk) => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('audio:chunk', chunk);
+    /**
+     * Shared chunk handler: convert the raw stereo-s16 PCM to mono Float32 and
+     * forward to the renderer. Guarded against window destruction so a capture
+     * that outlives the window (rare race on teardown) doesn't throw.
+     *
+     * @param {Buffer} chunk
+     */
+    const onChunk = (chunk) => {
+      try {
+        if (!chunk || chunk.length < 4) return;
+        const float32 = pcmStereoS16ToMonoF32(chunk);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('audio:chunk', float32);
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[audio:start] chunk handler threw:', err && err.message ? err.message : err);
       }
-    });
-    capture.on('warn', (/** @type {string} */ line) => {
-      // eslint-disable-next-line no-console
-      console.warn(`[ffmpeg] ${line}`);
-    });
-    capture.on('error', (/** @type {Error} */ err) => {
-      // eslint-disable-next-line no-console
-      console.error('[ffmpeg] capture error:', err.message);
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('audio:error', { message: err.message });
-      }
-    });
-    capture.on('exit', (code, signal) => {
-      // eslint-disable-next-line no-console
-      console.log(`[ffmpeg] process exited (code=${code} signal=${signal})`);
-    });
+    };
 
-    await capture.start();
+    if (wantSystem) {
+      capture.startSystemAudio(onChunk);
+    } else {
+      // includeProcessTree = true: captures the process AND any child processes
+      // it spawns (e.g. a game launching a launcher, or a browser with helper
+      // processes that emit audio).
+      capture.start(/** @type {number} */ (pid), true, onChunk);
+    }
+
     currentCapture = capture;
-    return { ok: true, sampleRate, channels };
+    return { ok: true, sampleRate: 48000, channels: 1 };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     // eslint-disable-next-line no-console
-    console.error('[main] audio:start failed:', message);
+    console.error('[audio:start] failed:', message);
+    // Surface the failure to the renderer's onAudioError subscription too, so
+    // the user sees it in the UI rather than just in the main-process console.
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('audio:error', { message });
+    }
     return { ok: false, error: message };
   }
 });
 
 /**
- * IPC: stop the current capture (if any).
+ * IPC: stop the current capture (if any). Always resolves to `{ ok: true }`.
  */
 ipcMain.handle('audio:stop', async () => {
   try {
     if (currentCapture) {
-      currentCapture.stop();
+      try {
+        currentCapture.stop();
+      } catch {
+        /* ignore */
+      }
       currentCapture = null;
     }
     return { ok: true };
@@ -1185,11 +1198,11 @@ function installCertBypass(config) {
   );
 }
 
-// Pre-resolve ffmpeg path so we log the discovery (or warning) once at startup.
+// Pre-load the loopback-capture native module so we surface any load failure
+// at startup (logged once) instead of on the first audio:start call.
 app.whenReady().then(async () => {
   registerProtocol();
   Menu.setApplicationMenu(buildMenu());
-  getFFmpegPath(); // logs resolved path / warning
 
   // (1) Dev override: when SCREENSHARE_URL is set in env we skip the settings
   //     UI entirely and load that URL directly. This preserves the existing
@@ -1220,7 +1233,7 @@ app.whenReady().then(async () => {
 });
 
 // Quit when all windows are closed, except on macOS. Also tear down any
-// running FFmpeg capture so we don't leak orphaned subprocesses.
+// running loopback capture so we don't leak a live WASAPI session.
 app.on('window-all-closed', () => {
   if (currentCapture) {
     try {
@@ -1251,5 +1264,5 @@ module.exports = {
   parseScreenShareUrl,
   DEFAULT_URL,
   RESOLVED_URL,
-  getFFmpegPath,
+  pcmStereoS16ToMonoF32,
 };

@@ -21,8 +21,6 @@ server/certs/*.pem
 electron/node_modules/
 electron/dist/
 electron/out/
-# Downloaded FFmpeg binary — ~97MB, fetched by `npm -w electron run download-ffmpeg`.
-electron/bin/
 # `electron/build/` is buildResources — the icon.ico there MUST be committed,
 # but we keep other generated artifacts ignored.
 electron/build/*.unpacked

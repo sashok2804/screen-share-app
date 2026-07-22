@@ -1,63 +1,61 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { StartProcessAudioOptions } from '../electron';
 
 /**
- * Renderer-side bridge between the FFmpeg subprocess (main process) and the
- * WebRTC mesh. Receives raw Float32 PCM chunks via IPC and turns them into a
- * `MediaStreamTrack` backed by a `ScriptProcessorNode` +
+ * Renderer-side bridge between the WASAPI loopback capture (main process) and
+ * the WebRTC mesh. Receives raw mono Float32 PCM chunks via IPC and turns them
+ * into a `MediaStreamTrack` backed by a `ScriptProcessorNode` +
  * `MediaStreamAudioDestinationNode`.
  *
  * Flow:
- *   main: ffmpeg.exe -f dshow -i audio="..." -f f32le pipe:1
- *      ↓ (chunk: Float32Array) IPC `audio:chunk`
+ *   main: loopback-capture native addon (per-process or system-wide WASAPI)
+ *      ↓ (chunk: Float32Array, mono, 48 kHz) IPC `audio:chunk`
  *   renderer (this hook):
  *      ↓ handleChunk() pushes into a ring buffer
  *   ScriptProcessorNode.onaudioprocess drains the ring into its output buffer
  *      → MediaStreamAudioDestinationNode
  *      → destination.stream.getAudioTracks()[0]
  *
- * Why `ScriptProcessorNode` instead of the worklet-based processor that used
- *   to live here?
+ * Why `ScriptProcessorNode` instead of an AudioWorklet?
  *   In the packaged Electron build (and on the production server) the
  *   Content-Security-Policy is `script-src 'self' 'unsafe-inline'` — it does
  *   NOT include `data:`. Vite inlines the module source as a
  *   `data:text/javascript;base64,...` URL in production builds, so loading
- *   that module is rejected by the CSP and throws an
- *   `AbortError` ("The user aborted a request"). `ScriptProcessorNode` runs
- *   inline on the main thread, needs no external module load and therefore no
- *   CSP exceptions — it works in browsers and packaged Electron alike. The CPU
- *   cost is negligible for a single mono voice-publish path.
+ *   that module is rejected by the CSP and throws an `AbortError`. The
+ *   deprecated `ScriptProcessorNode` runs inline on the main thread, needs no
+ *   external module load and therefore no CSP exceptions. The CPU cost is
+ *   negligible for a single mono audio-publish path.
  *
  * Only active when `window.electronAPI?.isElectron === true`. Browser builds
  * resolve to no-ops (`start()` returns null, `stop()` is a no-op).
  *
- * Audio format notes:
- *   - We request **mono** (channels: 1) from FFmpeg so the ring buffer matches
- *     the WebRTC voice-publish path. If the user later wants stereo, change
- *     `channels` here and de-interleave in `handleChunk`.
- *   - Sample rate is fixed at 48000 to match the AudioContext; the WebRTC
- *     sender will resample as needed for the codec.
+ * Audio format: the main process already delivers **mono Float32 at 48 kHz**
+ * (it converts the WASAPI stereo s16 stream down to mono f32), so the ring
+ * buffer matches the Web Audio graph and the WebRTC voice-publish path
+ * one-to-one — no client-side resampling.
  */
 
 export interface UseProcessAudioResult {
   /** `true` after start() has succeeded and the track is alive. */
   isActive: boolean;
-  /** Last error message surfaced from the FFmpeg bridge (or null). */
+  /** Last error message surfaced from the loopback bridge (or null). */
   error: string | null;
   /**
    * Start capturing. Returns the resulting audio track, or null on failure
-   * (including the browser-build no-op case and missing FFmpeg).
+   * (including the browser-build no-op case, missing selection, and main-
+   * process errors).
    *
-   * If `deviceName` is omitted, the hook calls `listAudioDevices()` and picks a
-   * sensible default (preferring virtual loopback devices like Voicemeeter /
-   * VB-Audio Virtual Cable over microphones). See `pickDefaultAudioDevice`.
+   * `opts` must be either `{ pid: <number> }` (per-process, echo-free) or
+   * `{ system: true }` (whole default render endpoint). Passing nothing is an
+   * error: the host must explicitly choose an audio source via
+   * `<ProcessAudioPicker>` before streaming.
    */
-  start: (deviceName?: string) => Promise<MediaStreamTrack | null>;
+  start: (opts: StartProcessAudioOptions) => Promise<MediaStreamTrack | null>;
   /** Stop the capture and release all resources. Safe to call when idle. */
   stop: () => Promise<void>;
 }
 
 const TARGET_SAMPLE_RATE = 48000;
-const TARGET_CHANNELS = 1;
 
 /**
  * ScriptProcessor buffer size in sample-frames. Must be a power of two in
@@ -71,78 +69,6 @@ const BUFFER_SIZE = 4096;
  * to absorb IPC jitter without dropping samples.
  */
 const RING_SIZE = 16384;
-
-/**
- * Heuristic default-device picker for DirectShow **loopback** capture.
- *
- * The goal is to capture what the sound card is *playing* (system audio,
- * games, video) — NOT what the user is saying into a microphone. This is the
- * inverse of mic capture, so the priority list has to favour physical
- * speakers/headphones and Windows' built-in loopback over virtual microphones
- * and cables.
- *
- * Order (first match wins):
- *   1. Windows' built-in loopback endpoints — `Stereo Mix` (English),
- *      `Стерео микшер` (Russian), `Что слышно` (Russian UI), `Wave Out`,
- *      `Loopback`, anything with `Mix` as a whole word. These are frequently
- *      disabled by default but are exactly what we want when present.
- *   2. Voicemeeter HARDWARE outputs in order — `Voicemeeter Out A1` first
- *      (the typical speakers/headphones output), then `A2`, `A3`, then a
- *      catch-all `A\d` for the rest. A1 is listed explicitly because the
- *      dshow enumeration order is not stable: on many installs `A4` sorts
- *      before `A1`, and without an explicit rule the picker chose `A4`
- *      (often not wired to anything) and peers heard silence.
- *   3. `Voicemeeter VAIO` (`Voicemeeter Input`) — captures whatever is routed
- *      into the mixer.
- *
- * Explicitly **NOT** preferred (these are virtual microphones / virtual cables
- * that carry the user's *voice*, not the system sound):
- *   - `Voicemeeter Out B1` / `B2` / `B3` (virtual mic sent to Discord etc.)
- *   - `Voicemeeter AUX`
- *   - `CABLE Output` (VB-Audio Virtual Cable receiver end)
- *
- * Fall-through: the first device that does not look like a microphone / virtual
- * mic / virtual cable, else the first device whatever it is.
- *
- * Exported so the picker can be unit-tested independently of the hook.
- *
- * @param devices  DirectShow audio device names from `listAudioDevices()`.
- * @returns the chosen device name (guaranteed non-empty if `devices` is).
- */
-export function pickDefaultAudioDevice(devices: string[]): string {
-  // Priority order: try most-specific patterns first.
-  // The Voicemeeter block lists each hardware A-output by number before the
-  // generic `A\d` fallback, so A1 (typical speakers/headphones) is picked over
-  // A2/A3/A4 even when A4 sorts earlier in the dshow enumeration. With a single
-  // `/Voicemeeter Out A\d/i` rule the regex matched the FIRST device in array
-  // order — which on real installs is frequently A4 (not wired to anything),
-  // so peers heard silence.
-  const priority = [
-    /Stereo Mix/i,
-    /Стерео микшер/i,
-    /Что слышно/i,
-    /Wave Out/i,
-    /Loopback/i,
-    /Mix\b/i,
-    // Voicemeeter HARDWARE OUT — A1 is the typical speakers/headphones output.
-    /Voicemeeter Out A1/i,
-    /Voicemeeter Out A2/i,
-    /Voicemeeter Out A3/i,
-    /Voicemeeter Out A\d/i, // fallback for other A-devices (A4, A5, ...)
-    /Voicemeeter VAIO/i,
-  ];
-  for (const pattern of priority) {
-    const match = devices.find((d) => pattern.test(d));
-    if (match) return match;
-  }
-  // Fall back to the first device that's NOT obviously a microphone or
-  // virtual cable — those capture voice, not system sound.
-  const nonMic = devices.find(
-    (d) =>
-      !/микрофон|microphone|mic|Voicemeeter Out B\d|CABLE Output|AUX/i.test(d),
-  );
-  return nonMic ?? devices[0];
-}
 
 export function useProcessAudio(): UseProcessAudioResult {
   const isElectron =
@@ -234,7 +160,7 @@ export function useProcessAudio(): UseProcessAudioResult {
   }, []);
 
   const start = useCallback(
-    async (deviceName?: string): Promise<MediaStreamTrack | null> => {
+    async (opts: StartProcessAudioOptions): Promise<MediaStreamTrack | null> => {
       if (!isElectron || !window.electronAPI) {
         // Browser build — caller should not have invoked us; bail gracefully.
         setError(null);
@@ -246,42 +172,22 @@ export function useProcessAudio(): UseProcessAudioResult {
         return null;
       }
 
+      // Validate the selection before doing any AudioContext work: the host
+      // must explicitly choose either a process or system audio. We never
+      // want to silently capture something the user didn't pick.
+      const hasPid = typeof opts?.pid === 'number';
+      const wantSystem = opts?.system === true;
+      if (!hasPid && !wantSystem) {
+        setError('Audio source not selected. Pick an application or system audio.');
+        return null;
+      }
+
       // Clean up any prior session before starting a new one.
       await teardown();
       setError(null);
 
-      // If the caller did not name a device, try to pick a sensible default
-      // (virtual loopback sink > microphone). We never want to send an empty
-      // name down to FFmpeg — that resolves to the non-existent `dummy` device
-      // and the capture exits with code 1 ("user aborted a request" in the UI).
-      if (!deviceName) {
-        try {
-          const devices = await api.listAudioDevices?.();
-          const audioDevices = devices?.audio ?? [];
-          // Log the full list so the user / support can see what dshow
-          // actually exposes on this machine — Voicemeeter routing in
-          // particular varies a lot between installs.
-          // eslint-disable-next-line no-console
-          console.log('[useProcessAudio] available audio devices:', audioDevices);
-          if (audioDevices.length === 0) {
-            setError(
-              'No audio capture devices found. Install VB-Cable or enable Stereo Mix.',
-            );
-            return null;
-          }
-          deviceName = pickDefaultAudioDevice(audioDevices);
-          // eslint-disable-next-line no-console
-          console.log('[useProcessAudio] picked device:', deviceName);
-        } catch (err) {
-          console.error('[useProcessAudio] listAudioDevices failed:', err);
-          // Fall through — the empty name will be rejected by the main process
-          // with a clearer "No audio device specified" message than the old
-          // `dummy` exit-1 path.
-        }
-      }
-
       try {
-        // 1) Set up the AudioContext + ScriptProcessor BEFORE starting FFmpeg
+        // 1) Set up the AudioContext + ScriptProcessor BEFORE starting capture
         //    so the first chunk has a destination ready.
         const Ctor: typeof AudioContext =
           window.AudioContext ||
@@ -327,7 +233,7 @@ export function useProcessAudio(): UseProcessAudioResult {
         node.connect(dest);
         destinationRef.current = dest;
 
-        // 2) Subscribe to chunk / error events. Each FFmpeg chunk is pushed
+        // 2) Subscribe to chunk / error events. Each captured chunk is pushed
         //    into the ring buffer; the ScriptProcessor's onaudioprocess will
         //    pull from it on the next audio quantum.
         const handleChunk = (chunk: Float32Array) => {
@@ -361,17 +267,13 @@ export function useProcessAudio(): UseProcessAudioResult {
 
         if (api.onAudioError) {
           unsubscribeErrorRef.current = api.onAudioError((payload) => {
-            console.error('[useProcessAudio] ffmpeg error:', payload.message);
+            console.error('[useProcessAudio] capture error:', payload.message);
             setError(payload.message);
           });
         }
 
-        // 3) Ask the main process to spawn FFmpeg.
-        const result = await api.startProcessAudio({
-          deviceName,
-          sampleRate: TARGET_SAMPLE_RATE,
-          channels: TARGET_CHANNELS,
-        });
+        // 3) Ask the main process to start WASAPI loopback capture.
+        const result = await api.startProcessAudio(opts);
         if (!result || result.ok !== true) {
           const msg = result && result.ok === false ? result.error : 'unknown start error';
           setError(msg);
