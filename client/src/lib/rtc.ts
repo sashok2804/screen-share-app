@@ -10,7 +10,26 @@ import type { QualityPreset } from './quality';
 
 // RTP codec mimeType fragments. WebRTC uses "video/AV1", "video/VP9", "video/H264"
 // (NOT the ISOBMFF/MP4 fourcc "av01"/"vp09" forms).
-const CODEC_PRIORITY = ['av1', 'vp9', 'h264'] as const;
+// VP8 is included for broader compatibility (older peers / non-Chromium).
+const CODEC_PRIORITY = ['av1', 'vp9', 'vp8', 'h264'] as const;
+
+/**
+ * "Real" video codec mimeTypes that `RTCRtpTransceiver.setCodecPreferences`
+ * accepts on Chrome/Edge. Capability lists also report payload-format helpers
+ * — `video/rtx` (retransmission), `video/red` (redundancy), `video/ulpfec`
+ * and `video/flexfec-*` (forward error correction) — which Chrome REJECTS with
+ * an `InvalidModificationError`. We drop them before ordering.
+ *
+ * Compared case-insensitively. The literal `av1x` appears on some Chromium
+ * builds; treat it as AV1's cousin rather than a real entry (it is NOT valid
+ * for setCodecPreferences today).
+ */
+const VALID_VIDEO_CODECS = new Set([
+  'video/av1',
+  'video/vp9',
+  'video/vp8',
+  'video/h264',
+]);
 
 export interface RtpCapabilitiesLike {
   codecs?: Array<{ mimeType: string }>;
@@ -46,7 +65,15 @@ export function sortCodecsByPriority(
 /**
  * Applies the codec preference order to a transceiver, using the *browser's*
  * own capability list as the source (so we never pass an unsupported codec).
- * Returns the filtered/reordered codec list, or `null` if unavailable.
+ *
+ * Robust against Chrome's `InvalidModificationError`: capability lists contain
+ * helper payload formats (rtx/red/ulpfec/flexfec) and the bare `video/H264`
+ * entry that Chrome refuses inside `setCodecPreferences`. We filter those out
+ * first; if nothing survives, or if Chrome still rejects the list, we log a
+ * warning and return `null` rather than throwing.
+ *
+ * Returns the filtered/reordered codec list actually handed to
+ * `setCodecPreferences`, or `null` if we deliberately skipped the call.
  */
 export function applyCodecPreferences(
   transceiver: TransceiverLike,
@@ -55,9 +82,31 @@ export function applyCodecPreferences(
 ): Array<{ mimeType: string }> | null {
   const caps = getCapabilities(kind);
   if (!caps?.codecs?.length) return null;
-  const ordered = sortCodecsByPriority(caps.codecs);
-  transceiver.setCodecPreferences(ordered);
-  return ordered;
+
+  // Filter out non-real codecs (rtx/red/flexfec/ulpfec and friends) that
+  // Chrome reports in capabilities but rejects in setCodecPreferences.
+  // For audio we pass everything through — the helper formats are rare and
+  // we never observed Chrome rejecting an audio preference list.
+  const realCodecs = caps.codecs.filter((c) => {
+    if (kind !== 'video') return true;
+    return VALID_VIDEO_CODECS.has(c.mimeType.toLowerCase());
+  });
+
+  if (realCodecs.length === 0) {
+    console.warn(
+      '[rtc] no valid video codecs after filtering, skipping setCodecPreferences',
+    );
+    return null;
+  }
+
+  const ordered = sortCodecsByPriority(realCodecs);
+  try {
+    transceiver.setCodecPreferences(ordered);
+    return ordered;
+  } catch (err) {
+    console.warn('[rtc] setCodecPreferences rejected the list, skipping:', err);
+    return null;
+  }
 }
 
 /**

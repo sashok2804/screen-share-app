@@ -84,6 +84,96 @@ describe('applyCodecPreferences', () => {
     expect(result).toBeNull();
     expect(setCodecPreferences).not.toHaveBeenCalled();
   });
+
+  it('filters out rtx/red/ulpfec/flexfec before calling setCodecPreferences', () => {
+    // Real Chrome capability list: H264, its rtx payload, AV1, red, ulpfec.
+    // setCodecPreferences would throw InvalidModificationError on the helpers.
+    const setCodecPreferences = vi.fn();
+    const transceiver = { setCodecPreferences };
+    const getCapabilities = () => ({
+      codecs: [
+        { mimeType: 'video/H264' },
+        { mimeType: 'video/rtx' },
+        { mimeType: 'video/AV1' },
+        { mimeType: 'video/red' },
+        { mimeType: 'video/ulpfec' },
+        { mimeType: 'video/flexfec-08' },
+      ],
+    });
+    const result = applyCodecPreferences(transceiver, 'video', getCapabilities);
+    expect(setCodecPreferences).toHaveBeenCalledTimes(1);
+    expect(setCodecPreferences).toHaveBeenCalledWith([
+      { mimeType: 'video/AV1' },
+      { mimeType: 'video/H264' },
+    ]);
+    expect(result?.map((c) => c.mimeType)).toEqual(['video/AV1', 'video/H264']);
+  });
+
+  it('is case-insensitive when filtering (lowercase h264)', () => {
+    const setCodecPreferences = vi.fn();
+    const transceiver = { setCodecPreferences };
+    const getCapabilities = () => ({
+      codecs: [{ mimeType: 'video/h264' }, { mimeType: 'video/vp9' }],
+    });
+    const result = applyCodecPreferences(transceiver, 'video', getCapabilities);
+    expect(result?.map((c) => c.mimeType)).toEqual(['video/vp9', 'video/h264']);
+  });
+
+  it('returns null and skips the call when only helper codecs exist', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const setCodecPreferences = vi.fn();
+    const transceiver = { setCodecPreferences };
+    const getCapabilities = () => ({
+      codecs: [
+        { mimeType: 'video/rtx' },
+        { mimeType: 'video/red' },
+        { mimeType: 'video/ulpfec' },
+      ],
+    });
+    const result = applyCodecPreferences(transceiver, 'video', getCapabilities);
+    expect(result).toBeNull();
+    expect(setCodecPreferences).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('returns null (and does not throw) when setCodecPreferences rejects the list', () => {
+    // Simulate Chrome rejecting the (already filtered) list for some other
+    // reason — e.g. a duplicate mimeType we couldn't dedupe.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const setCodecPreferences = vi.fn(() => {
+      throw new DOMException(
+        'Invalid codec preferences: invalid codec with name "H264".',
+        'InvalidModificationError',
+      );
+    });
+    const transceiver = { setCodecPreferences };
+    const getCapabilities = () => ({
+      codecs: [{ mimeType: 'video/H264' }],
+    });
+    const result = applyCodecPreferences(transceiver, 'video', getCapabilities);
+    expect(setCodecPreferences).toHaveBeenCalledTimes(1);
+    expect(result).toBeNull();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('passes audio codecs through unfiltered', () => {
+    const setCodecPreferences = vi.fn();
+    const transceiver = { setCodecPreferences };
+    const getCapabilities = () => ({
+      codecs: [{ mimeType: 'audio/opus' }, { mimeType: 'audio/telephone-event' }],
+    });
+    const result = applyCodecPreferences(transceiver, 'audio', getCapabilities);
+    expect(setCodecPreferences).toHaveBeenCalledWith([
+      { mimeType: 'audio/opus' },
+      { mimeType: 'audio/telephone-event' },
+    ]);
+    expect(result?.map((c) => c.mimeType)).toEqual([
+      'audio/opus',
+      'audio/telephone-event',
+    ]);
+  });
 });
 
 describe('applyBitrate', () => {

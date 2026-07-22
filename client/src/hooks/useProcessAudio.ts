@@ -73,17 +73,33 @@ const BUFFER_SIZE = 4096;
 const RING_SIZE = 16384;
 
 /**
- * Heuristic default-device picker for DirectShow audio capture.
+ * Heuristic default-device picker for DirectShow **loopback** capture.
  *
- * On a stock Windows install FFmpeg's "default" input is effectively unusable
- * for loopback (it tends to grab the default microphone), and there is no
- * `dummy` device either. So when the caller does not name a device we prefer,
- * in order:
- *   1. Virtual loopback sinks that the user installed precisely for this
- *      purpose — Voicemeeter Out B1 / AUX, VB-Audio Virtual Cable ("CABLE
- *      Output"), Stereo Mix, Wave Out Mix, anything labelled "Loopback".
- *   2. The first device that doesn't look like a microphone.
- *   3. The first device, whatever it is.
+ * The goal is to capture what the sound card is *playing* (system audio,
+ * games, video) — NOT what the user is saying into a microphone. This is the
+ * inverse of mic capture, so the priority list has to favour physical
+ * speakers/headphones and Windows' built-in loopback over virtual microphones
+ * and cables.
+ *
+ * Order (first match wins):
+ *   1. Windows' built-in loopback endpoints — `Stereo Mix` (English),
+ *      `Стерео микшер` (Russian), `Что слышно` (Russian UI), `Wave Out`,
+ *      `Loopback`, anything with `Mix` as a whole word. These are frequently
+ *      disabled by default but are exactly what we want when present.
+ *   2. Voicemeeter HARDWARE outputs — `Voicemeeter Out A1/A2/A3` (the physical
+ *      speakers/headphones). These show up in dshow as capture endpoints and
+ *      represent the actual loopback signal.
+ *   3. `Voicemeeter VAIO` (`Voicemeeter Input`) — captures whatever is routed
+ *      into the mixer.
+ *
+ * Explicitly **NOT** preferred (these are virtual microphones / virtual cables
+ * that carry the user's *voice*, not the system sound):
+ *   - `Voicemeeter Out B1` / `B2` / `B3` (virtual mic sent to Discord etc.)
+ *   - `Voicemeeter AUX`
+ *   - `CABLE Output` (VB-Audio Virtual Cable receiver end)
+ *
+ * Fall-through: the first device that does not look like a microphone / virtual
+ * mic / virtual cable, else the first device whatever it is.
  *
  * Exported so the picker can be unit-tested independently of the hook.
  *
@@ -92,18 +108,26 @@ const RING_SIZE = 16384;
  */
 export function pickDefaultAudioDevice(devices: string[]): string {
   const priority = [
-    /Voicemeeter Out B1/i,
-    /Voicemeeter AUX/i,
-    /CABLE Output/i,
     /Stereo Mix/i,
+    /Стерео микшер/i,
+    /Что слышно/i,
     /Wave Out/i,
     /Loopback/i,
+    /Mix\b/i,
+    // Voicemeeter hardware outputs — physical speakers/headphones.
+    /Voicemeeter Out A\d/i,
+    /Voicemeeter VAIO/i,
   ];
   for (const pattern of priority) {
     const match = devices.find((d) => pattern.test(d));
     if (match) return match;
   }
-  const nonMic = devices.find((d) => !/микрофон|microphone|mic/i.test(d));
+  // Fall back to the first device that's NOT obviously a microphone or
+  // virtual cable — those capture voice, not system sound.
+  const nonMic = devices.find(
+    (d) =>
+      !/микрофон|microphone|mic|Voicemeeter Out B\d|CABLE Output|AUX/i.test(d),
+  );
   return nonMic ?? devices[0];
 }
 
@@ -221,6 +245,11 @@ export function useProcessAudio(): UseProcessAudioResult {
         try {
           const devices = await api.listAudioDevices?.();
           const audioDevices = devices?.audio ?? [];
+          // Log the full list so the user / support can see what dshow
+          // actually exposes on this machine — Voicemeeter routing in
+          // particular varies a lot between installs.
+          // eslint-disable-next-line no-console
+          console.log('[useProcessAudio] available audio devices:', audioDevices);
           if (audioDevices.length === 0) {
             setError(
               'No audio capture devices found. Install VB-Cable or enable Stereo Mix.',
@@ -229,7 +258,7 @@ export function useProcessAudio(): UseProcessAudioResult {
           }
           deviceName = pickDefaultAudioDevice(audioDevices);
           // eslint-disable-next-line no-console
-          console.log('[useProcessAudio] auto-picked device:', deviceName);
+          console.log('[useProcessAudio] picked device:', deviceName);
         } catch (err) {
           console.error('[useProcessAudio] listAudioDevices failed:', err);
           // Fall through — the empty name will be rejected by the main process
